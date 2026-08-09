@@ -7,7 +7,7 @@
 #include <linux/ioctl.h>
 
 
-#define PYRITE_IOCTL_MAGIC 0xB7
+#define PYRITE_IOCTL_MAGIC 0xBE
 
 
 struct pyrite_alloc_req {

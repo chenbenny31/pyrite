@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
-KDIR ?= $(HOME)/src/linux
+KDIR ?= $(HOME)/Code/linux
 PWD  := $(CURDIR)
 
 .PHONY: all clean check
