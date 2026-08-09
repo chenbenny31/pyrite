@@ -12,4 +12,4 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 check:
-	$(KDIR)/scripts/checkpath.pl --no-tree -f pyrite.c uapi/pyrite.h
+	$(KDIR)/scripts/checkpatch.pl --no-tree -f pyrite.c uapi/pyrite.h
