@@ -88,6 +88,74 @@ static void pyrite_util_bump(struct pyrite_dev *dev)
 	dev->last_op = jiffies;
 }
 
+static ssize_t capacity_mb_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	u64 val;
+
+	mutex_lock(&dev->lock);
+	val = dev->capacity >> 20;
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%llu\n", val);
+}
+static DEVICE_ATTR_RO(capacity_mb);
+
+static ssize_t used_mb_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	u64 val;
+
+	mutex_lock(&dev->lock);
+	val = dev->used >> 20;
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%llu\n", val);
+}
+static DEVICE_ATTR_RO(used_mb);
+
+static ssize_t util_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	u32 val;
+
+	mutex_lock(&dev->lock);
+	val = pyrite_util_read(dev);
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+static DEVICE_ATTR_RO(util);
+
+static ssize_t numa_node_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "0\n");
+}
+static DEVICE_ATTR_RO(numa_node);
+
+static ssize_t pcie_addr_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+
+	return sysfs_emit(buf, "0000:%02x:00.0\n", dev->index);
+}
+static DEVICE_ATTR_RO(pcie_addr);
+
+static struct attribute *pyrite_attrs[] = {
+	&dev_attr_capacity_mb.attr,
+	&dev_attr_used_mb.attr,
+	&dev_attr_util.attr,
+	&dev_attr_numa_node.attr,
+	&dev_attr_pcie_addr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(pyrite);
+
 static int pyrite_open(struct inode *inode, struct file *filp)
 {
 	struct pyrite_fctx *fctx;
@@ -279,7 +347,6 @@ static int __init pyrite_init(void)
 		dev->next_alloc_id = 1;
 		dev->last_op = jiffies;
 		dev->index = i;
-
 	}
 
 	cdev_init(&pyrite_cdev, &pyrite_fops);
@@ -299,7 +366,7 @@ static int __init pyrite_init(void)
 
 		d = device_create_with_groups(pyrite_class, NULL,
 				MKDEV(MAJOR(pyrite_devt), i),
-				&devs[i], NULL, "pyrite%d", i);
+				&devs[i], pyrite_groups, "pyrite%d", i);
 		if (IS_ERR(d)) {
 			ret = PTR_ERR(d);
 			goto err_destroy_devices;
