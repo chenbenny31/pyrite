@@ -18,10 +18,10 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
-#include <linux/sizes.h>
 
 #include "uapi/pyrite.h"
 
@@ -92,13 +92,9 @@ static ssize_t capacity_mb_show(struct device *d,
 		struct device_attribute *attr, char *buf)
 {
 	struct pyrite_dev *dev = dev_get_drvdata(d);
-	u64 val;
 
-	mutex_lock(&dev->lock);
-	val = dev->capacity >> 20;
-	mutex_unlock(&dev->lock);
-
-	return sysfs_emit(buf, "%llu\n", val);
+	/* capacity is immutable after init; safe to read unlocked */
+	return sysfs_emit(buf, "%llu\n", dev->capacity >> 20);
 }
 static DEVICE_ATTR_RO(capacity_mb);
 
@@ -293,6 +289,92 @@ static long pyrite_ioctl_free(struct pyrite_fctx *fctx, void __user *uarg)
 	return 0;
 }
 
+static long pyrite_ioctl_query_device(struct pyrite_fctx *fctx, void __user *uarg)
+{
+	struct pyrite_dev *dev = fctx->dev;
+	struct pyrite_device_info info;
+
+	mutex_lock(&dev->lock);
+	info.capacity_bytes = dev->capacity;
+	info.used_bytes = dev->used;
+	info.util_pct = pyrite_util_read(dev);
+	info.alloc_count = dev->alloc_count;
+	mutex_unlock(&dev->lock);
+
+	if (copy_to_user(uarg, &info, sizeof(info)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long pyrite_ioctl_query_procs(struct pyrite_fctx *fctx, void __user *uarg)
+{
+	struct pyrite_dev *dev = fctx->dev;
+	struct pyrite_procs_query q;
+	struct pyrite_proc_entry *scratch = NULL;
+	struct pyrite_alloc *alloc;
+	u64 needed = 0;
+	u64 i;
+	long ret = 0;
+
+	if (copy_from_user(&q, uarg, sizeof(q)))
+		return -EFAULT;
+
+	mutex_lock(&dev->lock);
+
+	if (dev->alloc_count) {
+		scratch = kmalloc_array(dev->alloc_count, sizeof(*scratch), GFP_KERNEL);
+		if (!scratch) {
+			mutex_unlock(&dev->lock);
+			return -ENOMEM;
+		}
+	}
+
+	list_for_each_entry(alloc, &dev->allocs, node) {
+		for (i = 0; i < needed; i++) {
+			if (scratch[i].tgid == (u64)alloc->tgid) {
+				scratch[i].used_bytes += alloc->bytes;
+				break;
+			}
+		}
+
+		if (i == needed) {
+			scratch[needed].tgid = alloc->tgid;
+			scratch[needed].used_bytes = alloc->bytes;
+			needed++;
+		}
+	}
+
+	mutex_unlock(&dev->lock);
+
+	if (needed == 0) {
+		q.count = 0;
+		goto out_copy;
+	}
+
+	if (q.buf_ptr == 0 || q.count < needed) {
+		q.count = needed;
+		ret = -ERANGE;
+		goto out_copy;
+	}
+
+	if (copy_to_user(u64_to_user_ptr(q.buf_ptr), scratch,
+				needed * sizeof(*scratch))) {
+		kfree(scratch);
+		return -EFAULT;
+	}
+
+	q.count = needed;
+
+out_copy:
+	kfree(scratch);
+
+	if (copy_to_user(uarg, &q, sizeof(q)))
+		return -EFAULT;
+
+	return ret;
+}
+
 static long pyrite_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct pyrite_fctx *fctx = filp->private_data;
@@ -303,6 +385,10 @@ static long pyrite_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return pyrite_ioctl_alloc(fctx, uarg);
 	case PYRITE_IOC_FREE:
 		return pyrite_ioctl_free(fctx, uarg);
+	case PYRITE_IOC_QUERY_DEVICE:
+		return pyrite_ioctl_query_device(fctx, uarg);
+	case PYRITE_IOC_QUERY_PROCS:
+		return pyrite_ioctl_query_procs(fctx, uarg);
 	default:
 		return -ENOTTY;
 	}
