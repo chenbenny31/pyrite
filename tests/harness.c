@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <signal.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
 #include "../uapi/pyrite.h"
 
-#define DEV0 "/dev/pyrite0"
-#define DEV1 "/dev/pyrite1"
+#define DEV0	"/dev/pyrite0"
+#define DEV1	"/dev/pyrite1"
+#define DEV2	"/dev/pyrite2"
+#define SZ_4M	(4ULL * 1024 * 1024)
 
 static int failures;
 
@@ -61,6 +66,14 @@ static long query_device(int fd, struct pyrite_device_info *info)
 	memset(info, 0, sizeof(*info));
 
 	if (ioctl(fd, PYRITE_IOC_QUERY_DEVICE, info) < 0)
+		return -errno;
+
+	return 0;
+}
+
+static long query_procs(int fd, struct pyrite_procs_query *q)
+{
+	if (ioctl(fd, PYRITE_IOC_QUERY_PROCS, q) < 0)
 		return -errno;
 
 	return 0;
@@ -207,11 +220,121 @@ static void t_enomem(void)
 	report("enomem", 1, NULL);
 }
 
+static void t_procs_shape(void)
+{
+	struct pyrite_procs_query q;
+	struct pyrite_proc_entry entries[8];
+	int pipefd[2];
+	pid_t kids[2];
+	char sync;
+	int fd = -1, i, n_ready = 0;
+
+	if (pipe(pipefd) < 0) {
+		report("procs_shape", 0, "pipe failed");
+		return;
+	}
+
+	for (i = 0; i < 2; i++) {
+		kids[i] = fork();
+		if (kids[i] < 0) {
+			report("procs_shape", 0, "fork failed");
+			return;
+		}
+
+		if (kids[i] == 0) {
+			int cfd;
+
+			close(pipefd[0]);
+
+			/* open AFTER fork: no parent copy of this file */
+			cfd = open(DEV2, O_RDWR);
+			if (cfd < 0 || do_alloc(cfd, SZ_4M, NULL, NULL))
+				_exit(1);
+
+			if (write(pipefd[1], "r", 1) != 1)
+				_exit(1);
+
+			pause();
+			_exit(0);
+		}
+	}
+
+	close(pipefd[1]);
+
+	while (n_ready < 2 && read(pipefd[0], &sync, 1) == 1)
+		n_ready++;
+
+	if (n_ready != 2) {
+		report("procs_shape", 0, "children not ready");
+		goto out_kill;
+	}
+
+	fd = open(DEV2, O_RDWR);
+	if (fd < 0) {
+		report("procs_shape", 0, "open failed");
+		goto out_kill;
+	}
+
+	/* probe: buf_ptr == 0 */
+	memset(&q, 0, sizeof(q));
+	if (query_procs(fd, &q) != -ERANGE || q.count != 2) {
+		report("procs_shape", 0, "probe not ERANGE/2");
+		close(fd);
+		goto out_kill;
+	}
+
+	/* short buffer */
+	memset(&q, 0, sizeof(q));
+	q.count = 1;
+	q.buf_ptr = (unsigned long long)(uintptr_t)entries;
+	if (query_procs(fd, &q) != -ERANGE || q.count != 2) {
+		report("procs_shape", 0, "short buf not ERANGE/2");
+		close(fd);
+		goto out_kill;
+	}
+
+	/* full read */
+	memset(&q, 0, sizeof(q));
+	memset(entries, 0, sizeof(entries));
+	q.count = 8;
+	q.buf_ptr = (unsigned long long)(uintptr_t)entries;
+	if (query_procs(fd, &q) || q.count != 2) {
+		report("procs_shape", 0, "full read failed");
+		close(fd);
+		goto out_kill;
+	}
+
+	for (i = 0; i < 2; i++) {
+		if (entries[i].tgid != (unsigned long long)kids[0] &&
+		entries[i].tgid != (unsigned long long)kids[1]) {
+			report("procs_shape", 0, "tgid mismatch");
+			close(fd);
+			goto out_kill;
+		}
+		if (entries[i].used_bytes != SZ_4M) {
+			report("procs_shape", 0, "bytes mismatch");
+			close(fd);
+			goto out_kill;
+		}
+	}
+
+	close(fd);
+	report("procs_shape", 1, NULL);
+
+out_kill:
+	for (i = 0; i < 2; i++) {
+		kill(kids[i], SIGKILL);
+		waitpid(kids[i], NULL, 0);
+	}
+	close(pipefd[0]);
+}
+
 int main(void)
 {
 	t_rounding();
 	t_einval();
 	t_enomem();
+	t_procs_shape();
 
 	printf("%d failure(s)\n", failures);
 	return failures;
