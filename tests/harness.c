@@ -9,12 +9,14 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "../uapi/pyrite.h"
 
 #define DEV0	"/dev/pyrite0"
 #define DEV1	"/dev/pyrite1"
 #define DEV2	"/dev/pyrite2"
+#define DEV3	"/dev/pyrite3"
 #define SZ_4M	(4ULL * 1024 * 1024)
 
 static int failures;
@@ -329,12 +331,101 @@ out_kill:
 	close(pipefd[0]);
 }
 
+static void t_kill_cleanup(void)
+{
+	unsigned long long used0, used3;
+	struct timespec t0, t1;
+	int pipefd[2];
+	pid_t kid;
+	char sync;
+	double ms;
+	int i;
+
+	if (pipe(pipefd) < 0) {
+		report("kill_cleanup", 0, "pipe failed");
+		return;
+	}
+
+	kid = fork();
+	if (kid < 0) {
+		report("kill_cleanup", 0, "fork failed");
+		return;
+	}
+
+	if (kid == 0) {
+		int fd0, fd3;
+
+		close(pipefd[0]);
+
+		/* both opened AFTER fork: parent holds no copy */
+		fd0 = open(DEV0, O_RDWR);
+		fd3 = open(DEV3, O_RDWR);
+		if (fd0 < 0 || fd3 < 0)
+			_exit(1);
+
+		if (do_alloc(fd0, SZ_4M, NULL, NULL) || do_alloc(fd3, SZ_4M, NULL, NULL))
+			_exit(1);
+
+		if (write(pipefd[1], "r", 1) != 1)
+			_exit(1);
+
+		pause();
+		_exit(0);
+	}
+
+	close(pipefd[1]);
+
+	if (read(pipefd[0], &sync, 1) != 1) {
+		report("kill_cleanup", 0, "child not ready");
+		goto out;
+	}
+
+	if (read_sysfs_u64(0, "used_mb", &used0)
+			|| read_sysfs_u64(3, "used_mb", &used3)
+			|| used0 != 4 || used3 != 4) {
+		report("kill_cleanup", 0, "pre-kill accounting wrong");
+		goto out;
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	kill(kid, SIGKILL);
+	waitpid(kid, NULL, 0);
+
+	for (i = 0; i < 2000; i++) {
+		if (read_sysfs_u64(0, "used_mb", &used0) ||
+				read_sysfs_u64(3, "used_mb", &used3))
+			break;
+
+		if (used0 == 0 && used3 == 0)
+			break;
+
+		usleep(1000);
+	}
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+
+	if (used0 != 0 || used3 != 0) {
+		report("kill_cleanup", 0, "used not zero within 2s");
+		goto out;
+	}
+
+	ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+		(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+	printf("    reclaim latency: %.2f ms\n", ms);  
+
+	report("kill_cleanup", 1, NULL);
+
+out:
+	close(pipefd[0]);
+}
+
 int main(void)
 {
 	t_rounding();
 	t_einval();
 	t_enomem();
 	t_procs_shape();
+	t_kill_cleanup();
 
 	printf("%d failure(s)\n", failures);
 	return failures;
