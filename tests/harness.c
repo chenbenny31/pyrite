@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 
 #include "../uapi/pyrite.h"
 
@@ -18,6 +19,7 @@
 #define DEV2	"/dev/pyrite2"
 #define DEV3	"/dev/pyrite3"
 #define SZ_4M	(4ULL * 1024 * 1024)
+#define HAMMER_ITERS	10000
 
 static int failures;
 
@@ -37,6 +39,11 @@ static long do_alloc(int fd, unsigned long long bytes,
 	struct pyrite_alloc_req req;
 
 	memset(&req, 0, sizeof(req));
+	if (id)
+		*id = 0;
+	if (rounded)
+		*rounded = 0;
+
 	req.bytes = bytes;
 
 	if (ioctl(fd, PYRITE_IOC_ALLOC, &req) < 0)
@@ -411,12 +418,85 @@ static void t_kill_cleanup(void)
 
 	ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
 		(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
-	printf("    reclaim latency: %.2f ms\n", ms);  
+	printf("    reclaim latency: %.2f ms\n", ms);
 
 	report("kill_cleanup", 1, NULL);
 
 out:
 	close(pipefd[0]);
+}
+
+static void *hammer_thread(void *arg)
+{
+	unsigned int seed = (unsigned int)(uintptr_t)arg;
+	unsigned long long ids[64];
+	int held = 0;
+	int fd, i;
+
+	fd = open(DEV0, O_RDWR);
+	if (fd < 0)
+		return (void *)1;
+
+	for (i = 0; i < HAMMER_ITERS; i++) {
+		if (held < 64 && (held == 0 || rand_r(&seed) % 2)) {
+			unsigned long long id;
+
+			if (!do_alloc(fd, SZ_4M, &id, NULL))
+				ids[held++] = id;
+		} else {
+			int victim = rand_r(&seed) % held;
+
+			do_free(fd, ids[victim]);
+			ids[victim] = ids[--held];
+		}
+	}
+
+	while (held > 0)
+		do_free(fd, ids[--held]);
+
+	close(fd);
+
+	return NULL;
+}
+
+static void t_hammer(void)
+{
+	struct pyrite_device_info info;
+	pthread_t th[2];
+	void *rv;
+	int fd, i;
+
+	for (i = 0; i < 2; i++) {
+		if (pthread_create(&th[i], NULL, hammer_thread,
+					(void *)(uintptr_t)(i + 1))) {
+			report("hammer", 0, "pthread_create failed");
+			return;
+		}
+	}
+
+	for (i = 0; i < 2; i++) {
+		pthread_join(th[i], &rv);
+		if (rv) {
+			report("hammer", 0, "thread open failed");
+			return;
+		}
+	}
+
+	fd = open(DEV0, O_RDWR);
+	if (fd < 0 || query_device(fd, &info)) {
+		report("hammer", 0, "query failed");
+		if (fd >= 0)
+			close(fd);
+		return;
+	}
+	close(fd);
+
+	if (info.used_bytes != 0 || info.alloc_count != 0) {
+		report("hammer", 0, "state not zero after hammer");
+		return;
+	}
+
+	report("hammer", 1, NULL);
 }
 
 int main(void)
@@ -426,6 +506,7 @@ int main(void)
 	t_enomem();
 	t_procs_shape();
 	t_kill_cleanup();
+	t_hammer();
 
 	printf("%d failure(s)\n", failures);
 	return failures;
