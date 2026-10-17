@@ -8,7 +8,7 @@ set -u
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "run.sh: must run as root inside a virtme-ng guest" >&2
-    exit
+    exit 1
 fi
 
 case "$(uname -r)" in

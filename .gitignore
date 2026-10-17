@@ -9,3 +9,8 @@
 modules.order
 tests/harness
 bench/ioctl_bench
+
+# Local toolchain, kept in the repo dir but never committed
+/linux/
+/.venv/
+tests/hold
