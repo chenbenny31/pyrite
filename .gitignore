@@ -9,8 +9,12 @@
 modules.order
 tests/harness
 bench/ioctl_bench
+AGENTS.md
+AGENT_README.md
 
 # Local toolchain, kept in the repo dir but never committed
 /linux/
+/linux-debug/
 /.venv/
 tests/hold
+/.agents/
