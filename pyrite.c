@@ -10,23 +10,29 @@
 
 #include <linux/align.h>
 #include <linux/cdev.h>
+#include <linux/debugfs.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/jiffies.h>
+#include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/prandom.h>
 #include <linux/sched.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/uuid.h>
 
 #include "uapi/pyrite.h"
 
 #define PYRITE_MAX_DEV	16
 #define PYRITE_DEFAULT_CAP_MB	8192
+#define PYRITE_INJECT_MAX	32
 
 static int ndev = 4;
 module_param(ndev, int, 0444);
@@ -37,6 +43,10 @@ static int capacity_cnt;
 module_param_array(capacity_mb, ulong, &capacity_cnt, 0444);
 MODULE_PARM_DESC(capacity_mb, "per-device capacity in MiB (default 8192; 0 or unset = default)");
 
+static unsigned long long uuid_seed;
+module_param(uuid_seed, ullong, 0444);
+MODULE_PARM_DESC(uuid_seed, "seed for device UUIDs (default 0; give each node its own)");
+
 struct pyrite_fctx;
 
 struct pyrite_alloc {
@@ -45,6 +55,12 @@ struct pyrite_alloc {
 	pid_t tgid;	/* task_tgid_nr(current) at ALLOC */
 	struct pyrite_fctx *owner;
 	struct list_head node;
+};
+
+enum pyrite_health {
+	PYRITE_HEALTH_OK,	/* 0, so kcalloc'd devices start healthy */
+	PYRITE_HEALTH_XID,	/* fatal Xid reported; ALLOC fails */
+	PYRITE_HEALTH_LOST,	/* fell off the bus; every ioctl fails */
 };
 
 struct pyrite_dev {
@@ -58,6 +74,9 @@ struct pyrite_dev {
 	u32 util;	/* raw, as of last_op */
 	unsigned long last_op;	/* jiffies */
 	int index;
+	uuid_t uuid;	/* immutable after init */
+	enum pyrite_health health;
+	u32 last_xid;	/* 0 = none since load or reset */
 };
 
 struct pyrite_fctx {
@@ -69,6 +88,7 @@ static struct pyrite_dev *devs;
 static dev_t pyrite_devt;
 static struct cdev pyrite_cdev;
 static struct class *pyrite_class;
+static struct dentry *pyrite_debugfs;
 
 /* Caller holds dev->lock. */
 static u32 pyrite_util_read(const struct pyrite_dev *dev)
@@ -142,12 +162,59 @@ static ssize_t pcie_addr_show(struct device *d,
 }
 static DEVICE_ATTR_RO(pcie_addr);
 
+static ssize_t uuid_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+
+	/* uuid is immutable after init; safe to read unlocked */
+	return sysfs_emit(buf, "GPU-%pUb\n", &dev->uuid);
+}
+static DEVICE_ATTR_RO(uuid);
+
+static const char * const pyrite_health_names[] = {
+	[PYRITE_HEALTH_OK]	= "ok",
+	[PYRITE_HEALTH_XID]	= "xid",
+	[PYRITE_HEALTH_LOST]	= "lost",
+};
+
+static ssize_t health_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	enum pyrite_health val;
+
+	mutex_lock(&dev->lock);
+	val = dev->health;
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%s\n", pyrite_health_names[val]);
+}
+static DEVICE_ATTR_RO(health);
+
+static ssize_t last_xid_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	u32 val;
+
+	mutex_lock(&dev->lock);
+	val = dev->last_xid;
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+static DEVICE_ATTR_RO(last_xid);
+
 static struct attribute *pyrite_attrs[] = {
 	&dev_attr_capacity_mb.attr,
 	&dev_attr_used_mb.attr,
 	&dev_attr_util.attr,
 	&dev_attr_numa_node.attr,
 	&dev_attr_pcie_addr.attr,
+	&dev_attr_uuid.attr,
+	&dev_attr_health.attr,
+	&dev_attr_last_xid.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(pyrite);
@@ -221,6 +288,16 @@ static long pyrite_ioctl_alloc(struct pyrite_fctx *fctx, void __user *uarg)
 
 	mutex_lock(&dev->lock);
 
+	if (dev->health == PYRITE_HEALTH_LOST) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	if (dev->health == PYRITE_HEALTH_XID) {
+		ret = -EIO;
+		goto out_unlock;
+	}
+
 	if (dev->used + rounded > dev->capacity) {
 		ret = -ENOMEM;
 		goto out_unlock;
@@ -265,6 +342,11 @@ static long pyrite_ioctl_free(struct pyrite_fctx *fctx, void __user *uarg)
 
 	mutex_lock(&dev->lock);
 
+	if (dev->health == PYRITE_HEALTH_LOST) {
+		mutex_unlock(&dev->lock);
+		return -ENODEV;
+	}
+
 	list_for_each_entry(alloc, &dev->allocs, node) {
 		if (alloc->id == req.alloc_id && alloc->owner == fctx) {
 			found = alloc;
@@ -295,6 +377,12 @@ static long pyrite_ioctl_query_device(struct pyrite_fctx *fctx, void __user *uar
 	struct pyrite_device_info info;
 
 	mutex_lock(&dev->lock);
+
+	if (dev->health == PYRITE_HEALTH_LOST) {
+		mutex_unlock(&dev->lock);
+		return -ENODEV;
+	}
+
 	info.capacity_bytes = dev->capacity;
 	info.used_bytes = dev->used;
 	info.util_pct = pyrite_util_read(dev);
@@ -321,6 +409,11 @@ static long pyrite_ioctl_query_procs(struct pyrite_fctx *fctx, void __user *uarg
 		return -EFAULT;
 
 	mutex_lock(&dev->lock);
+
+	if (dev->health == PYRITE_HEALTH_LOST) {
+		mutex_unlock(&dev->lock);
+		return -ENODEV;
+	}
 
 	if (dev->alloc_count) {
 		scratch = kmalloc_array(dev->alloc_count, sizeof(*scratch), GFP_KERNEL);
@@ -402,8 +495,75 @@ static const struct file_operations pyrite_fops = {
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
+static ssize_t pyrite_inject_write(struct file *filp, const char __user *ubuf,
+		size_t count, loff_t *ppos)
+{
+	struct pyrite_dev *dev = filp->private_data;
+	char cmd[PYRITE_INJECT_MAX];
+	u32 xid;
+
+	if (count >= sizeof(cmd))
+		return -EINVAL;
+
+	if (copy_from_user(cmd, ubuf, count))
+		return -EFAULT;
+	cmd[count] = '\0';
+
+	if (str_has_prefix(cmd, "xid ")) {
+		if (kstrtou32(cmd + 4, 10, &xid) || xid == 0)
+			return -EINVAL;
+
+		mutex_lock(&dev->lock);
+		dev->health = PYRITE_HEALTH_XID;
+		dev->last_xid = xid;
+		mutex_unlock(&dev->lock);
+
+		dev_warn(dev->device, "Xid %u\n", xid);
+	} else if (sysfs_streq(cmd, "lost")) {
+		mutex_lock(&dev->lock);
+		dev->health = PYRITE_HEALTH_LOST;
+		mutex_unlock(&dev->lock);
+
+		dev_err(dev->device, "fell off the bus\n");
+	} else if (sysfs_streq(cmd, "reset")) {
+		mutex_lock(&dev->lock);
+		dev->health = PYRITE_HEALTH_OK;
+		dev->last_xid = 0;
+		mutex_unlock(&dev->lock);
+
+		dev_info(dev->device, "reset\n");
+	} else {
+		return -EINVAL;
+	}
+
+	return count;
+}
+
+static const struct file_operations pyrite_inject_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.write	= pyrite_inject_write,
+};
+
+/* Test-only fault injection; pyrite works the same without debugfs */
+static void pyrite_debugfs_init(void)
+{
+	int i;
+
+	pyrite_debugfs = debugfs_create_dir("pyrite", NULL);
+
+	for (i = 0; i < pyrite_ndev; i++) {
+		struct dentry *dir;
+
+		dir = debugfs_create_dir(dev_name(devs[i].device), pyrite_debugfs);
+		debugfs_create_file("inject", 0200, dir, &devs[i],
+				&pyrite_inject_fops);
+	}
+}
+
 static int __init pyrite_init(void)
 {
+	struct rnd_state rnd;
 	int i, ret;
 
 	if (ndev < 1 || ndev > PYRITE_MAX_DEV) {
@@ -420,6 +580,8 @@ static int __init pyrite_init(void)
 	if (ret)
 		goto err_free_devs;
 
+	prandom_seed_state(&rnd, uuid_seed);
+
 	for (i = 0; i < pyrite_ndev; i++) {
 		struct pyrite_dev *dev = &devs[i];
 		unsigned long cap_mb = PYRITE_DEFAULT_CAP_MB;
@@ -433,6 +595,11 @@ static int __init pyrite_init(void)
 		dev->next_alloc_id = 1;
 		dev->last_op = jiffies;
 		dev->index = i;
+
+		/* same seed, same UUIDs; version and variant bits as in uuid_gen() */
+		prandom_bytes_state(&rnd, dev->uuid.b, UUID_SIZE);
+		dev->uuid.b[6] = (dev->uuid.b[6] & 0x0f) | 0x40;
+		dev->uuid.b[8] = (dev->uuid.b[8] & 0x3f) | 0x80;
 	}
 
 	cdev_init(&pyrite_cdev, &pyrite_fops);
@@ -460,6 +627,8 @@ static int __init pyrite_init(void)
 		devs[i].device = d;
 	}
 
+	pyrite_debugfs_init();
+
 	pr_info("loaded: %d device(s), major %d\n",
 		pyrite_ndev, MAJOR(pyrite_devt));
 
@@ -482,6 +651,9 @@ err_free_devs:
 static void __exit pyrite_exit(void)
 {
 	int i;
+
+	/* waits for inject writes in progress */
+	debugfs_remove(pyrite_debugfs);
 
 	for (i = 0; i < pyrite_ndev; i++)
 		device_destroy(pyrite_class, MKDEV(MAJOR(pyrite_devt), i));
