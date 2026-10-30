@@ -8,6 +8,7 @@
 .tmp_versions/
 modules.order
 tests/harness
+tools/qualify
 bench/ioctl_bench
 AGENTS.md
 AGENT_README.md

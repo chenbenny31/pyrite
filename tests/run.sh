@@ -19,11 +19,12 @@ esac
 
 MOD=./pyrite.ko
 HARNESS=./tests/harness
+QUALIFY=./tools/qualify
 LOCKDEP=/proc/lockdep_stats
 KMEMLEAK=/sys/kernel/debug/kmemleak
 
-if [ ! -f "$MOD" ] || [ ! -x "$HARNESS" ]; then
-    echo "run.sh: build $MOD and $HARNESS first" >&2
+if [ ! -f "$MOD" ] || [ ! -x "$HARNESS" ] || [ ! -x "$QUALIFY" ]; then
+    echo "run.sh: build $MOD, $HARNESS and $QUALIFY first" >&2
     exit 1
 fi
 
@@ -72,6 +73,9 @@ insmod "$MOD" ndev=4 capacity_mb=8192,4096,2048,1024 || exit 1
 
 "$HARNESS"
 rc=$?
+
+./tests/qualify.sh
+rc=$((rc + $?))
 
 rmmod pyrite || rc=$((rc + 1))
 
