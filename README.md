@@ -18,12 +18,14 @@ kill -9 %1
 cat /sys/class/pyrite/pyrite0/used_mb    # 0
 ```
 
-**Status:** the module, its UAPI header, a 15-test harness and `tests/run.sh`
+**Status:** the module, its UAPI header, a 16-test harness and `tests/run.sh`
 are done, including device health, scratch memory and fault injection. The
 tests pass on the plain kernel and on a debug kernel with KASAN, lockdep and
 kmemleak. A [Kubernetes device plugin](#kubernetes) hands the devices to pods
-in a k3s VM and stops handing out a device once it fails. [Planned](#planned)
-lists what comes next.
+in a k3s VM and stops handing out a device once it fails. A [node
+agent](#qualification) finds bad devices, silent memory errors included, with a
+known-answer test and keeps them out of service until they pass again.
+[Planned](#planned) lists what comes next.
 
 ## How it differs
 
@@ -84,7 +86,8 @@ cannot see its devices.
 | `uuid_seed` | seed for device UUIDs, default 0 |
 | `scratch_kb` | [scratch memory](#scratch-memory) per device in KiB, 4..16384, default 1024 |
 
-Each device gets these read-only attributes under `/sys/class/pyrite/pyriteN/`:
+Each device gets these attributes under `/sys/class/pyrite/pyriteN/`, all
+read-only except `reset`:
 
 | Attribute | Content |
 | --- | --- |
@@ -99,6 +102,7 @@ Each device gets these read-only attributes under `/sys/class/pyrite/pyriteN/`:
 | `scratch_kb` | scratch memory size in KiB |
 | `ecc_ce_count` | corrected memory errors since load or `clear` |
 | `ecc_ue_count` | uncorrected memory errors since load or `clear` |
+| `reset` | write-only, root: `1` resets the device; see [Faults](#faults) |
 
 `numa_node` and `pcie_addr` are fake. They are there because discovery code
 expects them.
@@ -192,6 +196,12 @@ open, close and the sysfs files work as usual, and release still frees a dead
 client's memory. Argument errors (`EFAULT`, a zero-byte or oversize ALLOC) are
 reported before health.
 
+An operator resets a device by writing `1` to `/sys/class/pyrite/pyriteN/reset`.
+Like `nvidia-smi -r`, it refuses with `EBUSY` while the device has allocations,
+so the work on it has to leave first. It sets health back to `ok` and leaves
+memory errors in place. The `reset` command in debugfs is a test knob and skips
+the allocation check.
+
 The `inject` file is in debugfs because it is a test knob and stays out of the
 ABI. Without debugfs, pyrite works the same but can't fake faults.
 
@@ -265,6 +275,7 @@ was developed against v6.19.14. Keep `virtme` in the kernel's version suffix
 | --- | --- | --- |
 | Build module | host | `make && make check` |
 | Build harness | host | `gcc -Wall -Wextra -O2 -o tests/harness tests/harness.c -lpthread` |
+| Build qualify | host | `gcc -Wall -Wextra -O2 -o tools/qualify tools/qualify.c` |
 | Build reclaim demo | host | `gcc -Wall -Wextra -O2 -o tests/hold tests/hold.c` |
 | Boot guest | host, repo root | `vng -r ./linux --user root` |
 | Run tests | guest | `./tests/run.sh` |
@@ -303,10 +314,11 @@ The module has to be rebuilt for whichever kernel you boot:
 ## Tests
 
 `tests/run.sh` loads four devices (8192, 4096, 2048 and 1024 MiB), runs the
-harness and unloads. It only runs as root inside a virtme-ng guest, with
-`pyrite.ko` and `tests/harness` already built. The run fails when:
+harness and `tests/qualify.sh`, and unloads. It only runs as root inside a
+virtme-ng guest, with `pyrite.ko`, `tests/harness` and `tools/qualify` already
+built. The run fails when:
 
-- a harness test fails
+- a harness or `qualify` test fails
 - `rmmod` fails (a leaked file blocks unload)
 - a new `dmesg` line matches `WARN|BUG|KASAN|leak|general protection`
   (saved to `/tmp/pyrite-dmesg.txt`)
@@ -336,11 +348,17 @@ run on the wrong kernel cannot pass.
 | `t_ue` | 3 | a matching bit reads fine; a mismatched one fails with `EIO`, raises `ecc_ue_count` and sets health `xid`/48; the next page still reads |
 | `t_rate` | 3 | at 1,000,000 ppm a page of zeros reads back with exactly one bit set; at 0 it reads back clean |
 | `t_fault_cmds` | 3 | malformed `stuck` and `rate` commands return `EINVAL`, and a 65th stuck cell returns `ENOSPC` |
+| `t_reset` | 1 | sysfs `reset` returns `EBUSY` while an allocation exists and works once it is freed, even with the descriptor still open; values other than `1` return `EINVAL`; a stuck memory bit survives it |
 
 The harness needs a fresh load with at least four devices, because it opens
 `/dev/pyrite0` to `/dev/pyrite3` directly and checks exact `used_mb` values.
 The fault tests also need debugfs, which `run.sh` mounts. Each one resets or
 clears its device on every exit path.
+
+`tests/qualify.sh` runs `tools/qualify` on device 3. A clean device passes. A
+stuck silent bit fails whichever way it is stuck, and the bit errors `qualify`
+reports match `sdc_count`. A corrected bit passes. An uncorrected bit, a `lost`
+device and a missing device are device errors, and bad usage exits 3.
 
 `t_kill_cleanup` also prints the reclaim latency. In recorded runs it stayed
 under 0.2 ms on the plain kernel and under 1.2 ms on the debug kernel. The
@@ -360,9 +378,11 @@ and run on the debug kernel. Every run failed:
 | QUERY_DEVICE takes the mutex with preemption off | `DEBUG_ATOMIC_SLEEP` |
 | ALLOC takes the next device's lock inside its own | lockdep |
 
-The memory-error tests were checked the same way on the plain kernel. Each of
-eight planted bugs, such as an SDC that never flips its bit or a UE that leaves
-health alone, failed the test written for it.
+The memory-error and reset tests were checked the same way on the plain
+kernel. Each of nine planted bugs in the module, such as an SDC that never
+flips its bit or a reset that ignores allocations, failed the test written for
+it. So did two planted bugs in `qualify`: a missing comparison and ignored read
+errors.
 
 ## Kubernetes
 
@@ -385,9 +405,11 @@ privileged and mounts only kubelet's device plugin directory.
 
 The plugin reads each device's `health` file once a second (`-interval`) and
 tells kubelet when it changes. Only `ok` counts as Healthy; `xid`, `lost` and a
-failed read, as while the module is unloaded, are Unhealthy. kubelet then stops
-counting the device as allocatable, so no new pod gets it. A pod already on it
-keeps running, and kubelet marks the device Unhealthy in the pod's
+failed read, as while the module is unloaded, are Unhealthy. So is a device
+listed in `/var/lib/pyrite/quarantine`, the file the
+[qualifier](#qualification) writes. kubelet then stops counting the device as
+allocatable, so no new pod gets it. A pod already on it keeps running, and
+kubelet marks the device Unhealthy in the pod's
 `status.containerStatuses[].allocatedResourcesStatus`. That pod still holds its
 request, and the scheduler counts it against the lower allocatable, so a node
 with a failed GPU under a running pod has two GPUs to give out, not three,
@@ -432,23 +454,71 @@ checks that:
   device still counts
 - `reset` brings allocatable back to 4, and `lost` on another device drops it
   to 3 until the next `reset`
+- a UUID written to the quarantine file drops allocatable to 3 until it is
+  removed
 - unloading the module drops allocatable to 0, and loading it again brings all
   four back without restarting the plugin
 
 The test also prints how long the plugin and the node took to notice the Xid.
 
+## Qualification
+
+Silent errors are the faults `health` can't show, so something has to test the
+memory. `tools/qualify` writes four patterns over a device's scratch memory and
+reads each back: all zeros, all ones, seeded random data and its inverse. A
+stuck bit hides under one value, so the two solid patterns catch it whichever
+way it is stuck. It exits 0 when every device passes, 1 when data came back
+wrong, 2 on a device error and 3 on bad usage.
+
+`qualifier/` is an agent that runs on every node as a privileged DaemonSet,
+next to the plugin. It uses only what a real driver offers: sysfs health, the
+sysfs `reset` and the device files.
+
+- Every `-interval` it runs `qualify` on each device in service. `-k` failed
+  runs within `-window` quarantine the device, so one transient error doesn't.
+  A device error, or health other than `ok`, quarantines it at once.
+- Quarantine means writing the device's UUID to `/var/lib/pyrite/quarantine`
+  through a temporary file and a rename. The plugin reads the file and reports
+  the device Unhealthy within a second.
+- It then evicts the pods on the device, resets the device through sysfs once
+  they are gone, and runs `qualify` again. A pass puts the device back. After
+  `-max-requalify` failures the agent gives up and logs that the device needs
+  replacing.
+- With `-scope node`, one bad device takes every device on the node out of
+  service, as a `NoSchedule` taint would for GPU pods.
+- Every decision is a JSON log line with a timestamp, device, event and reason.
+
+The agent keeps everything on the node, so it needs no controller, no Node
+patches and no client-go. kubelet's PodResources socket names the pods on a
+device, and one REST call with the pod's service-account token evicts each one.
+Qualification runs next to working pods because scratch memory is separate
+from the ALLOC ledger; a real GPU would have to be idle for a full diagnostic.
+
+| Step | Command |
+| --- | --- |
+| Agent unit tests | `make -C qualifier test` |
+| End-to-end test, after the plugin's | `qualifier/e2e/run.sh` |
+
+`qualifier/e2e/run.sh` deploys the agent with short intervals and checks that:
+
+- every device passes its first qualification
+- a stuck silent bit under a running pod gets the device quarantined and the pod
+  evicted, and requalification fails until the bit is cleared
+- `sdc_count` shows that pyrite really handed out the bits the agent caught
+- one failed run does not quarantine a device when `-k` is 2
+- an `xid` quarantines a device at once, and the sysfs reset brings it back
+- a stuck uncorrected bit keeps a device out until it is cleared
+- with `-scope node`, one bad device drops allocatable to 0 until it is cleared
+
+The test removes the agent when it ends, because the plugin's test injects
+faults that the agent would act on.
+
 ## Planned
 
-The rest of the Kubernetes work is not written yet. In order:
-
-| Step | What it adds |
-| --- | --- |
-| Qualification | `tools/qualify` writes known patterns and checks them; a controller taints a failing node, runs the check as a Job, and removes the taint when it passes. `reset` will refuse a device that still has allocations, like `nvidia-smi -r` |
-| Experiment | inject faults at set rates and measure detection latency, false positives, missed faults and capacity lost to quarantine |
-
-Silent corruption is the fault `health` can't show. The device still reads
-`ok`, so only a test with a known answer finds it, and the experiment needs
-qualification in place before it can count missed faults.
+Next is the experiment: inject faults at set rates and measure detection
+latency, false positives, missed faults and capacity lost to quarantine, with
+device and node scope. The agent's event log gives the timings, and
+`sdc_count` says which silent errors were really there.
 
 After that come the ioctl latency benchmark, an ABI reference, and two features
 from [Roster](https://github.com/chenbenny31/roster)'s design: exclusive-process
@@ -481,11 +551,14 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | --- | --- |
 | `pyrite.c` | the module |
 | `uapi/pyrite.h` | ioctl structs and commands, shared with userspace |
-| `tests/harness.c` | 15-test harness |
+| `tests/harness.c` | 16-test harness |
 | `tests/run.sh` | in-guest gate: load, test, unload, check `dmesg`, lockdep and kmemleak |
 | `tests/hold.c` | reclaim demo from the top of this README |
+| `tests/qualify.sh` | tests of `qualify` against injected memory errors |
+| `tools/qualify.c` | known-answer test of scratch memory |
 | `deviceplugin/` | Kubernetes device plugin (Go), its image, DaemonSet and end-to-end test |
-| `vm/vm.sh` | single-node k3s VM for the plugin |
+| `qualifier/` | node agent (Go) that qualifies, quarantines and requalifies devices, with its image, DaemonSet and end-to-end test |
+| `vm/vm.sh` | single-node k3s VM for the plugin and the agent |
 | `Kbuild`, `Makefile` | out-of-tree build and `checkpatch` |
 
 ## License
