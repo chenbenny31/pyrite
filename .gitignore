@@ -16,5 +16,8 @@ AGENT_README.md
 /linux/
 /linux-debug/
 /.venv/
+/.vm/
+/.cache/
+deviceplugin/bin/
 tests/hold
 /.agents/
