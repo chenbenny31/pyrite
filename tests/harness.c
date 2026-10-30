@@ -149,6 +149,48 @@ static long inject(int index, const char *cmd)
 	return ret;
 }
 
+static long read_debugfs_u64(int index, const char *name, unsigned long long *out)
+{
+	char path[128];
+	FILE *f;
+	int n;
+
+	snprintf(path, sizeof(path), "/sys/kernel/debug/pyrite/pyrite%d/%s", index, name);
+
+	f = fopen(path, "r");
+	if (!f)
+		return -errno;
+
+	n = fscanf(f, "%llu", out);
+	fclose(f);
+
+	return n == 1 ? 0 : -EIO;
+}
+
+/* Write one byte at off, read it back; returns the byte read or -errno */
+static int poke_peek(int fd, off_t off, unsigned char val)
+{
+	unsigned char got;
+
+	if (pwrite(fd, &val, 1, off) != 1)
+		return -errno;
+	if (pread(fd, &got, 1, off) != 1)
+		return -errno;
+
+	return got;
+}
+
+/* ecc_ce_count, ecc_ue_count and debugfs sdc_count of a device, all as given */
+static int counts_are(int index, unsigned long long ce, unsigned long long ue,
+		unsigned long long sdc)
+{
+	unsigned long long c, u, s;
+
+	return !read_sysfs_u64(index, "ecc_ce_count", &c) && c == ce &&
+		!read_sysfs_u64(index, "ecc_ue_count", &u) && u == ue &&
+		!read_debugfs_u64(index, "sdc_count", &s) && s == sdc;
+}
+
 static int health_is(int index, const char *want, unsigned long long want_xid)
 {
 	unsigned long long xid;
@@ -713,6 +755,287 @@ out:
 	inject(2, "reset");
 }
 
+static void t_scratch_rw(void)
+{
+	unsigned char buf[16], got[16];
+	unsigned long long kb;
+	off_t size;
+	int fd, i;
+
+	if (read_sysfs_u64(3, "scratch_kb", &kb)) {
+		report("scratch_rw", 0, "no scratch_kb");
+		return;
+	}
+	size = kb * 1024;
+
+	fd = open(DEV3, O_RDWR);
+	if (fd < 0) {
+		report("scratch_rw", 0, "open failed");
+		return;
+	}
+
+	for (i = 0; i < 16; i++)
+		buf[i] = 0xa0 + i;
+
+	if (lseek(fd, 0, SEEK_END) != size) {
+		report("scratch_rw", 0, "SEEK_END is not the scratch size");
+		goto out;
+	}
+
+	/* 4088..4103 spans the first page boundary */
+	if (pwrite(fd, buf, 16, 4088) != 16 || pread(fd, got, 16, 4088) != 16 ||
+			memcmp(buf, got, 16)) {
+		report("scratch_rw", 0, "read back across a page differs");
+		goto out;
+	}
+
+	if (poke_peek(fd, size - 1, 0x5a) != 0x5a) {
+		report("scratch_rw", 0, "last byte differs");
+		goto out;
+	}
+
+	if (pread(fd, got, 16, size) != 0) {
+		report("scratch_rw", 0, "no EOF at the end");
+		goto out;
+	}
+
+	if (pwrite(fd, buf, 1, size) != -1 || errno != ENOSPC) {
+		report("scratch_rw", 0, "write at the end not ENOSPC");
+		goto out;
+	}
+
+	if (pwrite(fd, buf, 16, size - 4) != 4) {
+		report("scratch_rw", 0, "write across the end not short");
+		goto out;
+	}
+
+	if (inject(3, "lost") || pread(fd, got, 1, 0) != -1 || errno != ENODEV ||
+			pwrite(fd, buf, 1, 0) != -1 || errno != ENODEV) {
+		report("scratch_rw", 0, "lost device not ENODEV");
+		goto out;
+	}
+
+	report("scratch_rw", 1, NULL);
+out:
+	close(fd);
+	inject(3, "reset");
+}
+
+/* A stuck-at-1 bit: wrong data, nothing reported, ground truth counts it */
+static void t_sdc(void)
+{
+	int fd;
+
+	fd = open(DEV3, O_RDWR);
+	if (fd < 0) {
+		report("sdc", 0, "open failed");
+		return;
+	}
+
+	if (inject(3, "stuck sdc 100 3 1")) {
+		report("sdc", 0, "inject stuck failed");
+		goto out;
+	}
+
+	if (poke_peek(fd, 100, 0x00) != 0x08) {
+		report("sdc", 0, "0x00 did not read as 0x08");
+		goto out;
+	}
+
+	if (!counts_are(3, 0, 0, 1) || !health_is(3, "ok", 0)) {
+		report("sdc", 0, "silent error was reported, or sdc_count not 1");
+		goto out;
+	}
+
+	/* stuck at 1 under a 1 shows nothing, so a tester needs both patterns */
+	if (poke_peek(fd, 100, 0xff) != 0xff || !counts_are(3, 0, 0, 1)) {
+		report("sdc", 0, "stuck bit showed under 0xff");
+		goto out;
+	}
+
+	if (inject(3, "clear") || poke_peek(fd, 100, 0x00) != 0x00 ||
+			!counts_are(3, 0, 0, 0)) {
+		report("sdc", 0, "clear left the fault or the count");
+		goto out;
+	}
+
+	report("sdc", 1, NULL);
+out:
+	close(fd);
+	inject(3, "clear");
+}
+
+/* A corrected bit: right data, ecc_ce_count goes up on every read */
+static void t_ce(void)
+{
+	unsigned char got;
+	int fd;
+
+	fd = open(DEV3, O_RDWR);
+	if (fd < 0) {
+		report("ce", 0, "open failed");
+		return;
+	}
+
+	if (inject(3, "stuck ce 200 0 1")) {
+		report("ce", 0, "inject stuck failed");
+		goto out;
+	}
+
+	if (poke_peek(fd, 200, 0x00) != 0x00 || pread(fd, &got, 1, 200) != 1 ||
+			got != 0x00) {
+		report("ce", 0, "corrected data differs");
+		goto out;
+	}
+
+	if (!counts_are(3, 2, 0, 0) || !health_is(3, "ok", 0)) {
+		report("ce", 0, "ecc_ce_count not 2, or health changed");
+		goto out;
+	}
+
+	report("ce", 1, NULL);
+out:
+	close(fd);
+	inject(3, "clear");
+}
+
+/* An uncorrected bit: the read fails, the count goes up, health turns xid 48 */
+static void t_ue(void)
+{
+	unsigned char got[4];
+	int fd;
+
+	fd = open(DEV3, O_RDWR);
+	if (fd < 0) {
+		report("ue", 0, "open failed");
+		return;
+	}
+
+	if (inject(3, "stuck ue 300 7 0")) {
+		report("ue", 0, "inject stuck failed");
+		goto out;
+	}
+
+	if (poke_peek(fd, 300, 0x00) != 0x00 || !health_is(3, "ok", 0)) {
+		report("ue", 0, "a matching bit raised an error");
+		goto out;
+	}
+
+	if (poke_peek(fd, 300, 0x80) != -EIO) {
+		report("ue", 0, "read of the bad cell not EIO");
+		goto out;
+	}
+
+	if (!counts_are(3, 0, 1, 0) || !health_is(3, "xid", 48)) {
+		report("ue", 0, "ecc_ue_count not 1, or health not xid/48");
+		goto out;
+	}
+
+	if (pread(fd, got, 4, 4096) != 4) {
+		report("ue", 0, "the next page failed too");
+		goto out;
+	}
+
+	report("ue", 1, NULL);
+out:
+	close(fd);
+	inject(3, "clear");
+	inject(3, "reset");
+}
+
+/* At 100% a page read gets exactly one bit error; at 0, none */
+static void t_rate(void)
+{
+	unsigned char page[4096];
+	int fd, i, n;
+
+	fd = open(DEV3, O_RDWR);
+	if (fd < 0) {
+		report("rate", 0, "open failed");
+		return;
+	}
+
+	memset(page, 0, sizeof(page));
+	if (pwrite(fd, page, sizeof(page), 0) != (ssize_t)sizeof(page) ||
+			inject(3, "rate sdc 1000000") ||
+			pread(fd, page, sizeof(page), 0) != (ssize_t)sizeof(page)) {
+		report("rate", 0, "setup failed");
+		goto out;
+	}
+
+	for (i = 0, n = 0; i < (int)sizeof(page); i++)
+		n += __builtin_popcount(page[i]);
+	if (n != 1 || !counts_are(3, 0, 0, 1)) {
+		report("rate", 0, "100% did not give exactly one bit error");
+		goto out;
+	}
+
+	if (inject(3, "rate sdc 0") ||
+			pread(fd, page, sizeof(page), 0) != (ssize_t)sizeof(page)) {
+		report("rate", 0, "read at rate 0 failed");
+		goto out;
+	}
+
+	for (i = 0, n = 0; i < (int)sizeof(page); i++)
+		n += __builtin_popcount(page[i]);
+	if (n != 0) {
+		report("rate", 0, "rate 0 still flipped bits");
+		goto out;
+	}
+
+	report("rate", 1, NULL);
+out:
+	close(fd);
+	inject(3, "clear");
+}
+
+static void t_fault_cmds(void)
+{
+	const char *bad[] = {
+		"stuck sdc 0 8 1", "stuck sdc 0 0 2", "stuck foo 0 0 1",
+		"stuck sdc 0 0", "stuck sdc  0 0 1", "rate sdc 1000001",
+		"rate foo 1", "rate sdc",
+	};
+	unsigned long long kb;
+	char cmd[64];
+	int i;
+
+	if (read_sysfs_u64(3, "scratch_kb", &kb)) {
+		report("fault_cmds", 0, "no scratch_kb");
+		return;
+	}
+
+	snprintf(cmd, sizeof(cmd), "stuck sdc %llu 0 1", kb * 1024);
+	if (inject(3, cmd) != -EINVAL) {
+		report("fault_cmds", 0, "offset past the end not EINVAL");
+		goto out;
+	}
+
+	for (i = 0; i < (int)(sizeof(bad) / sizeof(bad[0])); i++) {
+		if (inject(3, bad[i]) != -EINVAL) {
+			report("fault_cmds", 0, bad[i]);
+			goto out;
+		}
+	}
+
+	for (i = 0; i < 64; i++) {
+		snprintf(cmd, sizeof(cmd), "stuck ce %d 0 1", i);
+		if (inject(3, cmd)) {
+			report("fault_cmds", 0, "fewer than 64 stuck cells fit");
+			goto out;
+		}
+	}
+
+	if (inject(3, "stuck ce 64 0 1") != -ENOSPC) {
+		report("fault_cmds", 0, "65th stuck cell not ENOSPC");
+		goto out;
+	}
+
+	report("fault_cmds", 1, NULL);
+out:
+	inject(3, "clear");
+}
+
 int main(void)
 {
 	t_rounding();
@@ -724,6 +1047,12 @@ int main(void)
 	t_uuid();
 	t_xid();
 	t_lost();
+	t_scratch_rw();
+	t_sdc();
+	t_ce();
+	t_ue();
+	t_rate();
+	t_fault_cmds();
 
 	printf("%d failure(s)\n", failures);
 	return failures;
