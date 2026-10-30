@@ -124,8 +124,9 @@ func dialPlugin(t *testing.T, dir string) pluginapi.DevicePluginClient {
 	return pluginapi.NewDevicePluginClient(conn)
 }
 
-// startPlugin runs a plugin in dir for the devices in sysClass. The returned
-// function stops it and fails the test unless Run returns nil within 5 s.
+// startPlugin runs a plugin in dir for the devices in sysClass, reading
+// quarantined UUIDs from <dir>/quarantine. The returned function stops it and
+// fails the test unless Run returns nil within 5 s.
 func startPlugin(t *testing.T, dir, sysClass string) func() {
 	t.Helper()
 	devs, err := Discover(sysClass)
@@ -134,7 +135,7 @@ func startPlugin(t *testing.T, dir, sysClass string) func() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- New(devs, dir, interval).Run(ctx) }()
+	go func() { done <- New(devs, dir, interval, filepath.Join(dir, "quarantine")).Run(ctx) }()
 
 	return func() {
 		cancel()
@@ -308,4 +309,47 @@ func TestHealth(t *testing.T) {
 
 	setHealth(t, sys, 1, "ok")
 	recvUntil(t, stream, "Healthy Healthy")
+}
+
+// A healthy device listed in the quarantine file is Unhealthy; an unreadable
+// quarantine file makes every device Unhealthy
+func TestQuarantine(t *testing.T) {
+	dir := t.TempDir()
+	q := filepath.Join(dir, "quarantine")
+	k := startKubelet(t, dir)
+	stop := startPlugin(t, dir, fakeSysfs(t, uuid0, uuid1))
+	defer stop()
+	k.wait(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := dialPlugin(t, dir).ListAndWatch(ctx, &pluginapi.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recvUntil(t, stream, "Healthy Healthy")
+
+	quarantine := func(ids ...string) {
+		t.Helper()
+		if err := os.WriteFile(q, []byte(strings.Join(ids, "\n")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	quarantine(uuid1)
+	recvUntil(t, stream, "Healthy Unhealthy")
+
+	quarantine(uuid1, uuid0)
+	recvUntil(t, stream, "Unhealthy Unhealthy")
+
+	if err := os.Remove(q); err != nil {
+		t.Fatal(err)
+	}
+	recvUntil(t, stream, "Healthy Healthy")
+
+	// a directory where the file should be can't be read
+	if err := os.Mkdir(q, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recvUntil(t, stream, "Unhealthy Unhealthy")
 }

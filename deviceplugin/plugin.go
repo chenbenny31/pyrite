@@ -31,18 +31,20 @@ const (
 type Plugin struct {
 	pluginapi.UnimplementedDevicePluginServer
 
-	devs      []Device
-	byID      map[string]Device
-	pluginDir string
-	interval  time.Duration // health reads and socket checks
+	devs       []Device
+	byID       map[string]Device
+	pluginDir  string
+	interval   time.Duration // health reads and socket checks
+	quarantine string        // file of quarantined UUIDs, one per line
 }
 
-func New(devs []Device, pluginDir string, interval time.Duration) *Plugin {
+func New(devs []Device, pluginDir string, interval time.Duration, quarantine string) *Plugin {
 	byID := make(map[string]Device, len(devs))
 	for _, d := range devs {
 		byID[d.ID] = d
 	}
-	return &Plugin{devs: devs, byID: byID, pluginDir: pluginDir, interval: interval}
+	return &Plugin{devs: devs, byID: byID, pluginDir: pluginDir, interval: interval,
+		quarantine: quarantine}
 }
 
 // Run serves on <pluginDir>/pyrite.sock and registers with kubelet. kubelet
@@ -127,23 +129,50 @@ func (p *Plugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*plu
 	return &pluginapi.DevicePluginOptions{}, nil
 }
 
+// readQuarantine returns the UUIDs in the quarantine file, which the
+// qualifier agent writes. A missing file means nothing is quarantined.
+func readQuarantine(path string) (map[string]bool, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	q := make(map[string]bool)
+	for _, id := range strings.Fields(string(b)) {
+		q[id] = true
+	}
+	return q, nil
+}
+
 // readHealth returns what each device's health file says, or the read error,
-// in device order.
+// in device order. A healthy device in quarantine reads "quarantined". If the
+// quarantine file exists but can't be read, every device is reported with
+// that error, so a bad device is never handed out by mistake.
 func (p *Plugin) readHealth() []string {
+	q, qerr := readQuarantine(p.quarantine)
 	got := make([]string, len(p.devs))
 	for i, d := range p.devs {
 		b, err := os.ReadFile(d.HealthFile)
-		if err != nil {
+		switch {
+		case err != nil:
 			got[i] = err.Error()
-		} else {
+		case qerr != nil:
+			got[i] = "quarantine file: " + qerr.Error()
+		default:
 			got[i] = strings.TrimSpace(string(b))
+			if got[i] == "ok" && q[d.ID] {
+				got[i] = "quarantined"
+			}
 		}
 	}
 	return got
 }
 
 // kubeHealth maps a health file reading to kubelet's terms. Only "ok" is
-// Healthy; "xid", "lost" and failed reads are all Unhealthy.
+// Healthy; "xid", "lost", "quarantined" and failed reads are all Unhealthy.
 func kubeHealth(reading string) string {
 	if reading == "ok" {
 		return pluginapi.Healthy

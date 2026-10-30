@@ -29,7 +29,15 @@ spec:
         volumeMounts:
         - name: device-plugins
           mountPath: /var/lib/kubelet/device-plugins
+        - name: pyrite-state
+          mountPath: /var/lib/pyrite
+          readOnly: true
       volumes:
       - name: device-plugins
         hostPath:
           path: /var/lib/kubelet/device-plugins
+      # The qualifier agent writes the quarantine file here
+      - name: pyrite-state
+        hostPath:
+          path: /var/lib/pyrite
+          type: DirectoryOrCreate

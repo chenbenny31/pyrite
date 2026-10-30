@@ -204,6 +204,12 @@ check "lost on pyrite$lost drops allocatable to 3" within 30 allocatable_is 3
 inject "$lost" reset
 check "reset brings it back to 4" within 30 allocatable_is 4
 
+# A UUID in the qualifier's quarantine file reads as Unhealthy
+echo "$(cat /sys/class/pyrite/pyrite0/uuid)" | sudo tee /var/lib/pyrite/quarantine > /dev/null
+check "quarantined pyrite0 drops allocatable to 3" within 30 allocatable_is 3
+sudo rm /var/lib/pyrite/quarantine
+check "unquarantined, allocatable is back to 4" within 30 allocatable_is 4
+
 # Unloaded, every health read fails; the plugin keeps running through it
 k delete pod hold --wait > /dev/null
 sudo modprobe -r pyrite

@@ -19,6 +19,7 @@ func main() {
 	sysClass := flag.String("sysfs", "/sys/class/pyrite", "pyrite's sysfs class directory")
 	pluginDir := flag.String("plugin-dir", pluginapi.DevicePluginPath, "kubelet's device plugin directory")
 	interval := flag.Duration("interval", time.Second, "how often to read device health and check the plugin socket")
+	quarantine := flag.String("quarantine", "/var/lib/pyrite/quarantine", "file of quarantined device UUIDs, one per line")
 	flag.Parse()
 
 	devs, err := Discover(*sysClass)
@@ -32,7 +33,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := New(devs, *pluginDir, *interval).Run(ctx); err != nil {
+	if err := New(devs, *pluginDir, *interval, *quarantine).Run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
