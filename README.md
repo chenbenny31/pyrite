@@ -4,7 +4,8 @@ pyrite lets you test a GPU scheduler on a machine with no GPUs. Each
 `/dev/pyriteN` is a mock GPU with a fixed VRAM capacity. It accepts or refuses
 allocations in 2 MiB units and reports usage per process (tgid) through
 `ioctl` and sysfs. When a client dies, even by `SIGKILL`, the kernel frees
-everything it allocated.
+everything it allocated. A test can also make a device fail on cue, with an Xid
+error or by falling off the bus, and check that the scheduler stops using it.
 
 In a guest, with the module and `tests/hold` built:
 
@@ -16,9 +17,10 @@ kill -9 %1
 cat /sys/class/pyrite/pyrite0/used_mb    # 0
 ```
 
-**Status:** the module, its UAPI header, a six-test harness and `tests/run.sh`
-are done. The tests pass on the plain kernel and on a debug kernel with KASAN,
-lockdep and kmemleak. [Planned](#planned) lists what comes next.
+**Status:** the module, its UAPI header, a nine-test harness and `tests/run.sh`
+are done, including device health and fault injection. The tests pass on the
+plain kernel and on a debug kernel with KASAN, lockdep and kmemleak.
+[Planned](#planned) lists what comes next.
 
 ## Why a kernel module
 
@@ -50,12 +52,13 @@ cannot see its devices.
 
 ## Devices and parameters
 
-`insmod` takes two parameters:
+`insmod` takes three parameters:
 
 | Parameter | Meaning |
 | --- | --- |
 | `ndev` | number of devices, 1..16, default 4 |
 | `capacity_mb` | capacity per device in MiB; `0` or unset means 8192 |
+| `uuid_seed` | seed for device UUIDs, default 0 |
 
 Each device gets these read-only attributes under `/sys/class/pyrite/pyriteN/`:
 
@@ -66,9 +69,17 @@ Each device gets these read-only attributes under `/sys/class/pyrite/pyriteN/`:
 | `util` | synthetic, 0..100, decays over time |
 | `numa_node` | always `0` |
 | `pcie_addr` | `0000:NN:00.0`, from the device index |
+| `uuid` | `GPU-` plus a version 4 UUID |
+| `health` | `ok`, `xid` or `lost`; see [Faults](#faults) |
+| `last_xid` | last injected Xid code; `0` if none since load or reset |
 
 `numa_node` and `pcie_addr` are fake. They are there because discovery code
 expects them.
+
+UUIDs come from the kernel's seeded PRNG, 16 bytes per device in index order.
+The same seed gives the same UUIDs on every load, the way a real GPU keeps its
+UUID across driver reloads. Kubernetes records allocated devices by ID, so a
+reload does not invalidate them. Give each node in a cluster its own seed.
 
 ## ioctl interface
 
@@ -77,12 +88,13 @@ padding, so `compat_ptr_ioctl` covers 32-bit callers.
 
 | Command | Struct (bytes) | Cmd word | Errors |
 | --- | --- | --- | --- |
-| `PYRITE_IOC_ALLOC` | `pyrite_alloc_req` (16) | `0xC010BE01` | `EINVAL`, `ENOMEM`, `EFAULT` |
-| `PYRITE_IOC_FREE` | `pyrite_free_req` (8) | `0x4008BE02` | `EINVAL`, `EFAULT` |
-| `PYRITE_IOC_QUERY_DEVICE` | `pyrite_device_info` (32) | `0x8020BE03` | `EFAULT` |
-| `PYRITE_IOC_QUERY_PROCS` | `pyrite_procs_query` (16) | `0xC010BE04` | `ERANGE`, `ENOMEM`, `EFAULT` |
+| `PYRITE_IOC_ALLOC` | `pyrite_alloc_req` (16) | `0xC010BE01` | `EINVAL`, `ENOMEM`, `EFAULT`, `EIO`, `ENODEV` |
+| `PYRITE_IOC_FREE` | `pyrite_free_req` (8) | `0x4008BE02` | `EINVAL`, `EFAULT`, `ENODEV` |
+| `PYRITE_IOC_QUERY_DEVICE` | `pyrite_device_info` (32) | `0x8020BE03` | `EFAULT`, `ENODEV` |
+| `PYRITE_IOC_QUERY_PROCS` | `pyrite_procs_query` (16) | `0xC010BE04` | `ERANGE`, `ENOMEM`, `EFAULT`, `ENODEV` |
 
-Other commands return `ENOTTY`. The magic number is `0xBE`. The first version
+`EIO` and `ENODEV` come from device health; see [Faults](#faults). Other
+commands return `ENOTTY`. The magic number is `0xBE`. The first version
 used `0xB7`, but `nsfs.h` and `remoteproc_cdev.h` already use that one.
 
 - **ALLOC.** A size of 0 returns `EINVAL`. Sizes are rounded up to a multiple
@@ -106,12 +118,52 @@ used `0xB7`, but `nsfs.h` and `remoteproc_cdev.h` already use that one.
   word, so after a layout change old callers get `ENOTTY` instead of corrupt
   data.
 
+## Faults
+
+A real GPU can't be made to fail at a chosen point in a test. With pyrite, root
+writes a command to `/sys/kernel/debug/pyrite/pyriteN/inject`, and the device
+acts as if the fault happened:
+
+```sh
+echo "xid 48" > /sys/kernel/debug/pyrite/pyrite1/inject
+cat /sys/class/pyrite/pyrite1/health     # xid
+echo reset > /sys/kernel/debug/pyrite/pyrite1/inject
+```
+
+| Command | Effect | dmesg |
+| --- | --- | --- |
+| `xid <code>`, code > 0 | health `xid`, `last_xid` = code | `pyrite pyriteN: Xid <code>` |
+| `lost` | health `lost` | `pyrite pyriteN: fell off the bus` |
+| `reset` | health `ok`, `last_xid` 0 | `pyrite pyriteN: reset` |
+
+Anything else returns `EINVAL`. Each command works from any state, and `reset`
+leaves allocations alone. Health changes what the ioctls return:
+
+| Call | `ok` | `xid` | `lost` |
+| --- | --- | --- | --- |
+| ALLOC | normal | `EIO` | `ENODEV` |
+| FREE | normal | normal | `ENODEV` |
+| QUERY_DEVICE, QUERY_PROCS | normal | normal | `ENODEV` |
+
+`xid` is a GPU that reported a fatal error. Work already on it can still free
+memory and monitors can still query it, but nothing new can be allocated.
+`lost` is a GPU that fell off the bus, so every ioctl fails. In every state,
+open, close and the sysfs files work as usual, and release still frees a dead
+client's memory. Argument errors (`EFAULT`, a zero-byte or oversize ALLOC) are
+reported before health.
+
+The `inject` file is in debugfs because it is a test knob and stays out of the
+ABI. Without debugfs, pyrite works the same but can't fake faults.
+
 ## Design notes
 
 - One `cdev` covers all `ndev` minors. Each device has its own ledger and one
   mutex.
-- `capacity` and `index` are set before `cdev_add` and never change, so they
-  are read without the lock.
+- `capacity`, `index` and `uuid` are set before `cdev_add` and never change, so
+  they are read without the lock.
+- `health` and `last_xid` are under the device mutex. Each ioctl checks health
+  inside the section it already locks, so an ALLOC either finishes before an
+  injected fault or fails after it.
 - `copy_from_user` and `copy_to_user` never run under the mutex. Data is
   copied into a local snapshot under the lock and copied out after unlocking.
 - ALLOC allocates its list node before locking, because its size is known.
@@ -124,6 +176,8 @@ used `0xB7`, but `nsfs.h` and `remoteproc_cdev.h` already use that one.
   capped at 100. A read halves it for every full second since the last ALLOC
   or FREE, and returns 0 after 32 seconds so the shift stays within a `u32`.
   Release does not change it.
+- debugfs is created last in init and removed first in exit. `debugfs_remove`
+  waits for writes in progress, so no `inject` write can touch a freed device.
 
 ## Build and run
 
@@ -199,9 +253,14 @@ run on the wrong kernel cannot pass.
 | `t_procs_shape` | 2 | two forked children hold 4 MiB each; the probe and a one-entry buffer both return `ERANGE` with count 2; the full read returns each child's tgid with 4 MiB |
 | `t_kill_cleanup` | 0, 3 | a forked child allocates 4 MiB on each device and is killed with `SIGKILL`; both `used_mb` must reach 0 within about 2 s |
 | `t_hammer` | 0 | two threads, each with its own descriptor, run 10k random 4 MiB ALLOC/FREE calls; the device ends with nothing used or allocated |
+| `t_uuid` | 0–3 | every `uuid` is well-formed, the four differ, and a second read matches |
+| `t_xid` | 1 | after `xid 48`, `health` and `last_xid` read back, ALLOC returns `EIO`, QUERY_DEVICE and FREE work, and `xid`, `xid 0` and `bogus` return `EINVAL`; after `reset`, ALLOC works |
+| `t_lost` | 2 | after `lost`, all four ioctls return `ENODEV`; closing the descriptor still brings `used_mb` to 0 |
 
 The harness needs a fresh load with at least four devices, because it opens
 `/dev/pyrite0` to `/dev/pyrite3` directly and checks exact `used_mb` values.
+`t_xid` and `t_lost` also need debugfs, which `run.sh` mounts. Both close their
+descriptor and reset the device on every exit path.
 
 `t_kill_cleanup` also prints the reclaim latency. In recorded runs it stayed
 under 0.2 ms on the plain kernel and under 1.2 ms on the debug kernel. The
@@ -223,25 +282,26 @@ and run on the debug kernel. Every run failed:
 
 ## Planned
 
-pyrite will also fake the GPU failures a scheduler has to handle. A real card
-can't be made to throw an Xid error or drop off the bus at a chosen point in a
-test. With pyrite, a test will set the failure through a root-only sysfs file,
-check how the scheduler reacts, then put the device back.
+The next steps make Kubernetes pyrite's first user. None of them is written
+yet. In order:
 
-Each feature comes from a case in [Roster](https://github.com/chenbenny31/roster)'s
-design. None of them is written yet. In order:
+| Step | What it adds |
+| --- | --- |
+| Device plugin | a Go DaemonSet in a k3s VM that advertises each device as `pyrite.dev/gpu`, keyed by UUID, and mounts `/dev/pyriteN` into the pod |
+| Health in the plugin | the plugin polls `health` and reports a failed device as Unhealthy, so kubelet stops giving it to new pods |
+| Silent data corruption | a small scratch buffer per device that tests write and read back, with injected corrected, uncorrected and silent bit flips, and ECC counters in sysfs |
+| Qualification | `tools/qualify` writes known patterns and checks them; a controller taints a failing node, runs the check as a Job, and removes the taint when it passes. `reset` will refuse a device that still has allocations, like `nvidia-smi -r` |
+| Experiment | inject faults at set rates and measure detection latency, false positives, missed faults and capacity lost to quarantine |
 
-| Feature | What it fakes | What it tests in a scheduler |
-| --- | --- | --- |
-| Per-device UUID, with an option to shuffle UUIDs against device numbers | `nvmlDeviceGetUUID` | GPUs are tracked by UUID, so leftover index-based code fails |
-| Fault injection: health `ok`, `xid` or `lost`, and queries that fail with `EIO` | Xid errors, a GPU falling off the bus, NVML query failures | a bad GPU is taken out of use, and a failed query is not read as "no processes" |
-| Exclusive-process mode: a second process's ALLOC gets `EBUSY` | NVML compute mode `EXCLUSIVE_PROCESS` | two jobs never share one GPU |
-| Delayed reclaim: freed memory stays counted for a set time after release | a driver still tearing down a dead process's context | a GPU is not handed to the next job while the old memory is still counted |
+Silent corruption is the fault `health` can't show. The device still reads
+`ok`, so only a test with a known answer finds it, and the experiment needs
+qualification in place before it can count missed faults.
 
-The ioctl latency benchmark and a standalone ABI reference come after these,
-because the features change the UAPI. Integration with Roster comes last.
-MIG/MPS, memory mapping, thermals and topology are not planned, because Roster
-does not use them.
+After that come the ioctl latency benchmark, an ABI reference, and two features
+from [Roster](https://github.com/chenbenny31/roster)'s design: exclusive-process
+mode (a second process's ALLOC gets `EBUSY`) and delayed reclaim (freed memory
+stays counted for a set time after release). Integration with Roster comes
+last. MIG/MPS, memory mapping, thermals and topology are not planned.
 
 ## Related work
 
@@ -265,7 +325,7 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | --- | --- |
 | `pyrite.c` | the module |
 | `uapi/pyrite.h` | ioctl structs and commands, shared with userspace |
-| `tests/harness.c` | six-test harness |
+| `tests/harness.c` | nine-test harness |
 | `tests/run.sh` | in-guest gate: load, test, unload, check `dmesg`, lockdep and kmemleak |
 | `tests/hold.c` | reclaim demo from the top of this README |
 | `Kbuild`, `Makefile` | out-of-tree build and `checkpatch` |
