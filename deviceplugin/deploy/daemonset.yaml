@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-only
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pyrite-device-plugin
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: pyrite-device-plugin
+  template:
+    metadata:
+      labels:
+        app: pyrite-device-plugin
+    spec:
+      priorityClassName: system-node-critical
+      # Keep running on tainted nodes; a quarantined node still needs its plugin
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: plugin
+        image: localhost/pyrite-device-plugin:dev
+        imagePullPolicy: Never
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: device-plugins
+          mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+      - name: device-plugins
+        hostPath:
+          path: /var/lib/kubelet/device-plugins

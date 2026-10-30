@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
+FROM scratch
+COPY bin/pyrite-device-plugin /pyrite-device-plugin
+ENTRYPOINT ["/pyrite-device-plugin"]
