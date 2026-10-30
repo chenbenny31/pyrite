@@ -149,6 +149,26 @@ static long inject(int index, const char *cmd)
 	return ret;
 }
 
+static long sysfs_write(int index, const char *attr, const char *val)
+{
+	char path[128];
+	long ret = 0;
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/class/pyrite/pyrite%d/%s", index, attr);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -errno;
+
+	if (write(fd, val, strlen(val)) < 0)
+		ret = -errno;
+
+	close(fd);
+
+	return ret;
+}
+
 static long read_debugfs_u64(int index, const char *name, unsigned long long *out)
 {
 	char path[128];
@@ -1036,6 +1056,55 @@ out:
 	inject(3, "clear");
 }
 
+/* sysfs reset works like nvidia-smi -r: refused while memory is allocated */
+static void t_reset(void)
+{
+	unsigned long long id;
+	int fd;
+
+	fd = open(DEV1, O_RDWR);
+	if (fd < 0) {
+		report("reset", 0, "open failed");
+		return;
+	}
+
+	if (do_alloc(fd, SZ_4M, &id, NULL) || inject(1, "xid 79")) {
+		report("reset", 0, "setup failed");
+		goto out;
+	}
+
+	if (sysfs_write(1, "reset", "1") != -EBUSY || !health_is(1, "xid", 79)) {
+		report("reset", 0, "reset with an allocation not EBUSY");
+		goto out;
+	}
+
+	if (sysfs_write(1, "reset", "0") != -EINVAL ||
+			sysfs_write(1, "reset", "2") != -EINVAL) {
+		report("reset", 0, "values other than 1 not EINVAL");
+		goto out;
+	}
+
+	/* an open descriptor with nothing allocated does not block it */
+	if (do_free(fd, id) || sysfs_write(1, "reset", "1\n") ||
+			!health_is(1, "ok", 0)) {
+		report("reset", 0, "reset after free failed");
+		goto out;
+	}
+
+	/* a reset does not fix bad memory */
+	if (inject(1, "stuck sdc 0 0 1") || sysfs_write(1, "reset", "1") ||
+			poke_peek(fd, 0, 0x00) != 0x01) {
+		report("reset", 0, "reset removed a memory error");
+		goto out;
+	}
+
+	report("reset", 1, NULL);
+out:
+	close(fd);
+	inject(1, "clear");
+	inject(1, "reset");
+}
+
 int main(void)
 {
 	t_rounding();
@@ -1053,6 +1122,7 @@ int main(void)
 	t_ue();
 	t_rate();
 	t_fault_cmds();
+	t_reset();
 
 	printf("%d failure(s)\n", failures);
 	return failures;

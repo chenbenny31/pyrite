@@ -278,6 +278,39 @@ static ssize_t ecc_ue_count_show(struct device *d,
 }
 static DEVICE_ATTR_RO(ecc_ue_count);
 
+/*
+ * Writing 1 resets the device the way nvidia-smi -r does: health goes back to
+ * ok, but only once nothing is allocated, so the work on it must leave first.
+ * Memory errors stay, since a reset does not fix bad memory. The debugfs
+ * reset is a test knob and skips the allocation check.
+ */
+static ssize_t reset_store(struct device *d, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	unsigned int val;
+	int ret = 0;
+
+	if (kstrtouint(buf, 10, &val) || val != 1)
+		return -EINVAL;
+
+	mutex_lock(&dev->lock);
+	if (dev->alloc_count) {
+		ret = -EBUSY;
+	} else {
+		dev->health = PYRITE_HEALTH_OK;
+		dev->last_xid = 0;
+	}
+	mutex_unlock(&dev->lock);
+
+	if (ret)
+		return ret;
+
+	dev_info(dev->device, "reset\n");
+	return count;
+}
+static DEVICE_ATTR_WO(reset);
+
 static ssize_t scratch_kb_show(struct device *d,
 		struct device_attribute *attr, char *buf)
 {
@@ -297,6 +330,7 @@ static struct attribute *pyrite_attrs[] = {
 	&dev_attr_scratch_kb.attr,
 	&dev_attr_ecc_ce_count.attr,
 	&dev_attr_ecc_ue_count.attr,
+	&dev_attr_reset.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(pyrite);
