@@ -106,6 +106,80 @@ static long read_sysfs_u64(int index, const char *attr, unsigned long long *out)
 	return n == 1 ? 0 : -EIO;
 }
 
+static long read_sysfs_str(int index, const char *attr, char *buf, size_t len)
+{
+	char path[128];
+	FILE *f;
+	char *line;
+
+	snprintf(path, sizeof(path), "/sys/class/pyrite/pyrite%d/%s", index, attr);
+
+	f = fopen(path, "r");
+	if (!f)
+		return -errno;
+
+	line = fgets(buf, len, f);
+	fclose(f);
+
+	if (!line)
+		return -EIO;
+
+	buf[strcspn(buf, "\n")] = '\0';
+
+	return 0;
+}
+
+static long inject(int index, const char *cmd)
+{
+	char path[128];
+	long ret = 0;
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/kernel/debug/pyrite/pyrite%d/inject", index);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -errno;
+
+	if (write(fd, cmd, strlen(cmd)) < 0)
+		ret = -errno;
+
+	close(fd);
+
+	return ret;
+}
+
+static int health_is(int index, const char *want, unsigned long long want_xid)
+{
+	unsigned long long xid;
+	char health[16];
+
+	return !read_sysfs_str(index, "health", health, sizeof(health)) &&
+		!strcmp(health, want) &&
+		!read_sysfs_u64(index, "last_xid", &xid) && xid == want_xid;
+}
+
+/* "GPU-" + RFC 4122 v4: xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx, lowercase */
+static int uuid_ok(const char *s)
+{
+	int i;
+
+	if (strlen(s) != 40 || strncmp(s, "GPU-", 4))
+		return 0;
+
+	s += 4;
+	for (i = 0; i < 36; i++) {
+		if (i == 8 || i == 13 || i == 18 || i == 23) {
+			if (s[i] != '-')
+				return 0;
+		} else if (!strchr("0123456789abcdef", s[i])) {
+			return 0;
+		}
+	}
+
+	return s[14] == '4' && strchr("89ab", s[19]);
+}
+
 static void t_rounding(void)
 {
 	unsigned long long id, rounded, used_mb;
@@ -499,6 +573,146 @@ static void t_hammer(void)
 	report("hammer", 1, NULL);
 }
 
+static void t_uuid(void)
+{
+	char uuid[4][64], again[64];
+	int i, j;
+
+	for (i = 0; i < 4; i++) {
+		if (read_sysfs_str(i, "uuid", uuid[i], sizeof(uuid[i])) ||
+				!uuid_ok(uuid[i])) {
+			report("uuid", 0, "malformed uuid");
+			return;
+		}
+
+		for (j = 0; j < i; j++) {
+			if (!strcmp(uuid[i], uuid[j])) {
+				report("uuid", 0, "duplicate uuid");
+				return;
+			}
+		}
+	}
+
+	for (i = 0; i < 4; i++) {
+		if (read_sysfs_str(i, "uuid", again, sizeof(again)) ||
+				strcmp(uuid[i], again)) {
+			report("uuid", 0, "uuid changed between reads");
+			return;
+		}
+	}
+
+	report("uuid", 1, NULL);
+}
+
+static void t_xid(void)
+{
+	struct pyrite_device_info info;
+	unsigned long long id;
+	int fd;
+
+	fd = open(DEV1, O_RDWR);
+	if (fd < 0) {
+		report("xid", 0, "open failed");
+		return;
+	}
+
+	if (do_alloc(fd, SZ_4M, &id, NULL)) {
+		report("xid", 0, "setup alloc failed");
+		goto out;
+	}
+
+	if (inject(1, "xid 48\n")) {
+		report("xid", 0, "inject xid failed");
+		goto out;
+	}
+
+	if (inject(1, "xid") != -EINVAL || inject(1, "xid 0") != -EINVAL ||
+			inject(1, "bogus") != -EINVAL) {
+		report("xid", 0, "bad command not EINVAL");
+		goto out;
+	}
+
+	if (!health_is(1, "xid", 48)) {
+		report("xid", 0, "health/last_xid not xid/48");
+		goto out;
+	}
+
+	if (do_alloc(fd, SZ_4M, NULL, NULL) != -EIO) {
+		report("xid", 0, "alloc not EIO");
+		goto out;
+	}
+
+	/* work already on the device can still query and free */
+	if (query_device(fd, &info) || info.alloc_count != 1 || do_free(fd, id)) {
+		report("xid", 0, "query or free failed");
+		goto out;
+	}
+
+	if (inject(1, "reset") || !health_is(1, "ok", 0)) {
+		report("xid", 0, "reset failed");
+		goto out;
+	}
+
+	if (do_alloc(fd, SZ_4M, NULL, NULL)) {
+		report("xid", 0, "alloc after reset failed");
+		goto out;
+	}
+
+	report("xid", 1, NULL);
+out:
+	/* close first: reset may later refuse a device with allocations */
+	close(fd);
+	inject(1, "reset");
+}
+
+static void t_lost(void)
+{
+	struct pyrite_device_info info;
+	struct pyrite_procs_query q;
+	unsigned long long id, used_mb;
+	int fd;
+
+	fd = open(DEV2, O_RDWR);
+	if (fd < 0) {
+		report("lost", 0, "open failed");
+		return;
+	}
+
+	if (do_alloc(fd, SZ_4M, &id, NULL)) {
+		report("lost", 0, "setup alloc failed");
+		close(fd);
+		return;
+	}
+
+	if (inject(2, "lost\n") || !health_is(2, "lost", 0)) {
+		report("lost", 0, "inject lost failed");
+		close(fd);
+		goto out;
+	}
+
+	memset(&q, 0, sizeof(q));
+	if (do_alloc(fd, SZ_4M, NULL, NULL) != -ENODEV ||
+			do_free(fd, id) != -ENODEV ||
+			query_device(fd, &info) != -ENODEV ||
+			query_procs(fd, &q) != -ENODEV) {
+		report("lost", 0, "ioctl not ENODEV");
+		close(fd);
+		goto out;
+	}
+
+	/* release reclaims even from a lost device */
+	close(fd);
+
+	if (read_sysfs_u64(2, "used_mb", &used_mb) || used_mb != 0) {
+		report("lost", 0, "used not zero after close");
+		goto out;
+	}
+
+	report("lost", 1, NULL);
+out:
+	inject(2, "reset");
+}
+
 int main(void)
 {
 	t_rounding();
@@ -507,6 +721,9 @@ int main(void)
 	t_procs_shape();
 	t_kill_cleanup();
 	t_hammer();
+	t_uuid();
+	t_xid();
+	t_lost();
 
 	printf("%d failure(s)\n", failures);
 	return failures;
