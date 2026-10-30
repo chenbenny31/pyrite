@@ -24,8 +24,9 @@ tests pass on the plain kernel and on a debug kernel with KASAN, lockdep and
 kmemleak. A [Kubernetes device plugin](#kubernetes) hands the devices to pods
 in a k3s VM and stops handing out a device once it fails. A [node
 agent](#qualification) finds bad devices, silent memory errors included, with a
-known-answer test and keeps them out of service until they pass again.
-[Planned](#planned) lists what comes next.
+known-answer test and keeps them out of service until they pass again. An
+[experiment](#experiment) measures how fast it finds a bad device and what
+false alarms cost. [Planned](#planned) lists what comes next.
 
 ## How it differs
 
@@ -513,18 +514,61 @@ from the ALLOC ledger; a real GPU would have to be idle for a full diagnostic.
 The test removes the agent when it ends, because the plugin's test injects
 faults that the agent would act on.
 
+## Experiment
+
+`experiment/run.sh` measures the qualifier on the k3s VM. Each scenario starts
+the agent on clean devices, gives `pyrite3` a stuck silent bit at a random
+spot, and gives the three good devices a background rate of transient silent
+errors. It runs for 2 minutes, with qualification every 5 s and
+requalification every 3 s, and keeps the agent's event log.
+`experiment/analyze.py` turns the logs into `experiment/results.csv`. One
+`qualify` run reads 1,024 pages, so at a per-page error rate r a good device
+fails a run with probability 1 − (1 − r)^1024.
+
+| Scope | k | Error rate | Detect | Good runs failed (expected) | False quarantines | Good devices given up | Capacity lost | Wasted |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| device | 1 | 0 | 2.8 s | 0% (0%) | 0 | 0 | 24% | 0% |
+| device | 1 | 200 ppm | 2.8 s | 26% (19%) | 16 | 0 | 27% | 2% |
+| device | 1 | 1000 ppm | 2.8 s | 65% (64%) | 15 | 2 | 74% | 49% |
+| device | 2 | 0 | 7.8 s | 0% (0%) | 0 | 0 | 23% | 0% |
+| device | 2 | 200 ppm | 8.8 s | 25% (19%) | 7 | 0 | 23% | 0% |
+| device | 2 | 1000 ppm | 8.8 s | 74% (64%) | 18 | 1 | 43% | 20% |
+| node | 2 | 200 ppm | 7.8 s | 24% (19%) | 7 | 0 | 94% | 70% |
+
+Capacity lost is the GPU time the quarantine file blocked, out of 4 GPUs for 2
+minutes; the bad device alone accounts for about 23%. Wasted is the part spent
+on good devices.
+
+The stuck bit was found in every run: 2.8 s after it went in at k=1, 8 to 9 s
+at k=2. Each extra failure that k asks for costs one more interval, so
+detection takes about U(0, interval) + (k − 1) × interval.
+
+At 200 ppm a good device fails about one run in four. k=2 halved the false
+quarantines, and because the agent retests at once and most retests pass, those
+devices were back before the plugin saw them: no capacity wasted at k=2, 2% at
+k=1. At 1000 ppm two runs in three fail and the noise wins. Retests fail too,
+good devices run out of retries and are given up on, and k=1 wasted half the
+node.
+
+Node scope turns one bad device into a whole-node outage: 94% of the capacity
+lost, against 23% at device scope.
+
+The measured failure rate matches 1 − (1 − r)^1024 at 1000 ppm and runs above
+it at 200 ppm, within the noise of about 60 runs per scenario. These are single
+2-minute runs on one node, with a 5 s interval picked for speed, so they show
+the trade-offs rather than tight estimates. The error streams are seeded, so
+scenarios at the same rate see the same errors, which makes k=1 and k=2 a
+paired comparison. Capacity is counted at the agent; the scheduler sees each
+change up to about 10 s later, when kubelet next posts node status.
+
 ## Planned
 
-Next is the experiment: inject faults at set rates and measure detection
-latency, false positives, missed faults and capacity lost to quarantine, with
-device and node scope. The agent's event log gives the timings, and
-`sdc_count` says which silent errors were really there.
-
-After that come the ioctl latency benchmark, an ABI reference, and two features
-from [Roster](https://github.com/chenbenny31/roster)'s design: exclusive-process
-mode (a second process's ALLOC gets `EBUSY`) and delayed reclaim (freed memory
-stays counted for a set time after release). Integration with Roster comes
-last. MIG/MPS, memory mapping, thermals and topology are not planned.
+Still to come are the ioctl latency benchmark, an ABI reference, and two
+features from [Roster](https://github.com/chenbenny31/roster)'s design:
+exclusive-process mode (a second process's ALLOC gets `EBUSY`) and delayed
+reclaim (freed memory stays counted for a set time after release). Integration
+with Roster comes last. MIG/MPS, memory mapping, thermals and topology are not
+planned.
 
 ## Related work
 
@@ -558,6 +602,7 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | `tools/qualify.c` | known-answer test of scratch memory |
 | `deviceplugin/` | Kubernetes device plugin (Go), its image, DaemonSet and end-to-end test |
 | `qualifier/` | node agent (Go) that qualifies, quarantines and requalifies devices, with its image, DaemonSet and end-to-end test |
+| `experiment/` | qualification experiment: `run.sh`, `analyze.py` and the results |
 | `vm/vm.sh` | single-node k3s VM for the plugin and the agent |
 | `Kbuild`, `Makefile` | out-of-tree build and `checkpatch` |
 
