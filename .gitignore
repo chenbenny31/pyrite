@@ -20,5 +20,7 @@ AGENT_README.md
 /.vm/
 /.cache/
 deviceplugin/bin/
+qualifier/bin/
+experiment/out/
 tests/hold
 /.agents/

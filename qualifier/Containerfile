@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The agent plus a static tools/qualify; built by "make image" from a
+# context holding just those two files
+
+FROM docker.io/library/alpine:3.24 AS build
+RUN apk add --no-cache gcc musl-dev
+COPY qualify.c /src/
+RUN gcc -static -O2 -Wall -Wextra -o /qualify /src/qualify.c
+
+FROM scratch
+COPY --from=build /qualify /usr/local/bin/qualify
+COPY pyrite-qualifier /pyrite-qualifier
+ENTRYPOINT ["/pyrite-qualifier"]

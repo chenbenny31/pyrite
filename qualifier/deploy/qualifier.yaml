@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The qualifier agent on every node. It needs the devices and a writable
+# sysfs (privileged), kubelet's PodResources socket, the quarantine file it
+# shares with the device plugin, and the right to evict pods.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pyrite-qualifier
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pyrite-qualifier
+rules:
+- apiGroups: [""]
+  resources: ["pods/eviction"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pyrite-qualifier
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pyrite-qualifier
+subjects:
+- kind: ServiceAccount
+  name: pyrite-qualifier
+  namespace: kube-system
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pyrite-qualifier
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: pyrite-qualifier
+  template:
+    metadata:
+      labels:
+        app: pyrite-qualifier
+    spec:
+      serviceAccountName: pyrite-qualifier
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: qualifier
+        image: localhost/pyrite-qualifier:dev
+        imagePullPolicy: Never
+        # Short intervals for a test VM; the binary's defaults suit a real node
+        args: ["-interval=10s", "-retry=5s", "-max-requalify=20"]
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: pyrite-state
+          mountPath: /var/lib/pyrite
+        - name: pod-resources
+          mountPath: /var/lib/kubelet/pod-resources
+      volumes:
+      - name: pyrite-state
+        hostPath:
+          path: /var/lib/pyrite
+          type: DirectoryOrCreate
+      - name: pod-resources
+        hostPath:
+          path: /var/lib/kubelet/pod-resources
