@@ -17,10 +17,12 @@
 #include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/minmax.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/prandom.h>
 #include <linux/sched.h>
+#include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -33,6 +35,11 @@
 #define PYRITE_MAX_DEV	16
 #define PYRITE_DEFAULT_CAP_MB	8192
 #define PYRITE_INJECT_MAX	32
+#define PYRITE_SCRATCH_MIN_KB	4
+#define PYRITE_SCRATCH_MAX_KB	16384
+#define PYRITE_MAX_STUCK	64
+#define PYRITE_PPM		1000000
+#define PYRITE_XID_DBE		48	/* NVIDIA's Xid for an uncorrectable ECC error */
 
 static int ndev = 4;
 module_param(ndev, int, 0444);
@@ -46,6 +53,10 @@ MODULE_PARM_DESC(capacity_mb, "per-device capacity in MiB (default 8192; 0 or un
 static unsigned long long uuid_seed;
 module_param(uuid_seed, ullong, 0444);
 MODULE_PARM_DESC(uuid_seed, "seed for device UUIDs (default 0; give each node its own)");
+
+static unsigned int scratch_kb = 1024;
+module_param(scratch_kb, uint, 0444);
+MODULE_PARM_DESC(scratch_kb, "per-device scratch memory in KiB for read/write tests (4..16384, default 1024)");
 
 struct pyrite_fctx;
 
@@ -63,6 +74,28 @@ enum pyrite_health {
 	PYRITE_HEALTH_LOST,	/* fell off the bus; every ioctl fails */
 };
 
+/* How a memory bit error shows to a reader */
+enum pyrite_ecc {
+	PYRITE_ECC_CE,	/* corrected: data right, ecc_ce_count goes up */
+	PYRITE_ECC_UE,	/* uncorrected: read fails, health turns xid */
+	PYRITE_ECC_SDC,	/* silent: data wrong, nothing reported */
+	PYRITE_ECC_NR,
+};
+
+static const char * const pyrite_ecc_names[] = {
+	[PYRITE_ECC_CE]		= "ce",
+	[PYRITE_ECC_UE]		= "ue",
+	[PYRITE_ECC_SDC]	= "sdc",
+};
+
+/* A scratch cell whose bit always reads as value */
+struct pyrite_stuck {
+	u32 offset;
+	u8 bit;
+	u8 value;
+	u8 ecc;		/* enum pyrite_ecc */
+};
+
 struct pyrite_dev {
 	struct device *device;
 	struct mutex lock;
@@ -77,6 +110,16 @@ struct pyrite_dev {
 	uuid_t uuid;	/* immutable after init */
 	enum pyrite_health health;
 	u32 last_xid;	/* 0 = none since load or reset */
+	u8 *scratch;	/* pyrite_scratch_size bytes, under lock */
+
+	/* Memory faults and their counters, all under lock */
+	struct pyrite_stuck stuck[PYRITE_MAX_STUCK];
+	unsigned int nr_stuck;
+	u32 rate[PYRITE_ECC_NR];	/* ppm chance of a bit error per page read */
+	struct rnd_state fault_rnd;
+	u64 ecc_ce_count;
+	u64 ecc_ue_count;
+	u64 sdc_count;	/* debugfs only: silent errors handed to readers */
 };
 
 struct pyrite_fctx {
@@ -89,6 +132,7 @@ static dev_t pyrite_devt;
 static struct cdev pyrite_cdev;
 static struct class *pyrite_class;
 static struct dentry *pyrite_debugfs;
+static loff_t pyrite_scratch_size;
 
 /* Caller holds dev->lock. */
 static u32 pyrite_util_read(const struct pyrite_dev *dev)
@@ -206,6 +250,41 @@ static ssize_t last_xid_show(struct device *d,
 }
 static DEVICE_ATTR_RO(last_xid);
 
+static ssize_t ecc_ce_count_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	u64 val;
+
+	mutex_lock(&dev->lock);
+	val = dev->ecc_ce_count;
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%llu\n", val);
+}
+static DEVICE_ATTR_RO(ecc_ce_count);
+
+static ssize_t ecc_ue_count_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	struct pyrite_dev *dev = dev_get_drvdata(d);
+	u64 val;
+
+	mutex_lock(&dev->lock);
+	val = dev->ecc_ue_count;
+	mutex_unlock(&dev->lock);
+
+	return sysfs_emit(buf, "%llu\n", val);
+}
+static DEVICE_ATTR_RO(ecc_ue_count);
+
+static ssize_t scratch_kb_show(struct device *d,
+		struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", scratch_kb);
+}
+static DEVICE_ATTR_RO(scratch_kb);
+
 static struct attribute *pyrite_attrs[] = {
 	&dev_attr_capacity_mb.attr,
 	&dev_attr_used_mb.attr,
@@ -215,6 +294,9 @@ static struct attribute *pyrite_attrs[] = {
 	&dev_attr_uuid.attr,
 	&dev_attr_health.attr,
 	&dev_attr_last_xid.attr,
+	&dev_attr_scratch_kb.attr,
+	&dev_attr_ecc_ce_count.attr,
+	&dev_attr_ecc_ue_count.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(pyrite);
@@ -487,13 +569,280 @@ static long pyrite_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 }
 
+/*
+ * Caller holds dev->lock, or dev is not visible yet. Removes all memory
+ * faults, zeroes the counters, and restarts the transient error stream from
+ * the device's UUID, so the same reads give the same errors after every clear.
+ */
+static void pyrite_clear_faults(struct pyrite_dev *dev)
+{
+	u64 seed;
+
+	dev->nr_stuck = 0;
+	memset(dev->rate, 0, sizeof(dev->rate));
+	dev->ecc_ce_count = 0;
+	dev->ecc_ue_count = 0;
+	dev->sdc_count = 0;
+
+	memcpy(&seed, dev->uuid.b, sizeof(seed));
+	prandom_seed_state(&dev->fault_rnd, seed);
+}
+
+/*
+ * Caller holds dev->lock. One bit error of class ecc at buf[off]. Returns
+ * true for an uncorrected error, which fails the read.
+ */
+static bool pyrite_bit_error(struct pyrite_dev *dev, u8 *buf, size_t off,
+		u8 mask, int ecc)
+{
+	switch (ecc) {
+	case PYRITE_ECC_CE:
+		dev->ecc_ce_count++;
+		return false;
+	case PYRITE_ECC_UE:
+		dev->ecc_ue_count++;
+		return true;
+	default:
+		buf[off] ^= mask;
+		dev->sdc_count++;
+		return false;
+	}
+}
+
+/*
+ * Caller holds dev->lock. buf holds len bytes just copied from scratch at pos,
+ * within one page. Applies the stuck cells in range and the transient rates
+ * to buf only; scratch keeps what was written. Returns true if an uncorrected
+ * error hit.
+ */
+static bool pyrite_apply_faults(struct pyrite_dev *dev, u8 *buf, loff_t pos,
+		size_t len)
+{
+	bool ue = false;
+	unsigned int i;
+
+	for (i = 0; i < dev->nr_stuck; i++) {
+		const struct pyrite_stuck *s = &dev->stuck[i];
+		u8 mask = BIT(s->bit);
+
+		if (s->offset < pos || s->offset >= pos + len)
+			continue;
+		/* a stuck cell shows only when the stored bit differs */
+		if (!!(buf[s->offset - pos] & mask) == s->value)
+			continue;
+		ue |= pyrite_bit_error(dev, buf, s->offset - pos, mask, s->ecc);
+	}
+
+	for (i = 0; i < PYRITE_ECC_NR; i++) {
+		u32 bit;
+
+		if (!dev->rate[i] ||
+				prandom_u32_state(&dev->fault_rnd) % PYRITE_PPM >= dev->rate[i])
+			continue;
+		bit = prandom_u32_state(&dev->fault_rnd) % (len * 8);
+		ue |= pyrite_bit_error(dev, buf, bit / 8, BIT(bit % 8), i);
+	}
+
+	return ue;
+}
+
+static loff_t pyrite_llseek(struct file *filp, loff_t off, int whence)
+{
+	return fixed_size_llseek(filp, off, whence, pyrite_scratch_size);
+}
+
+/*
+ * Scratch reads and writes go one page of scratch at a time through a bounce
+ * page, so no copy_*_user runs under the lock. A short count is returned if a
+ * later page fails. Memory faults apply to each page as it is read.
+ */
+static ssize_t pyrite_read(struct file *filp, char __user *ubuf,
+		size_t count, loff_t *ppos)
+{
+	struct pyrite_fctx *fctx = filp->private_data;
+	struct pyrite_dev *dev = fctx->dev;
+	loff_t pos = *ppos;
+	size_t done = 0;
+	ssize_t ret = 0;
+	void *bounce;
+	bool ue;
+
+	if (pos < 0)
+		return -EINVAL;
+	if (pos >= pyrite_scratch_size || count == 0)
+		return 0;
+	count = min_t(size_t, count, pyrite_scratch_size - pos);
+
+	bounce = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+
+	while (done < count) {
+		size_t len = min_t(size_t, count - done, PAGE_SIZE - offset_in_page(pos));
+
+		mutex_lock(&dev->lock);
+		if (dev->health == PYRITE_HEALTH_LOST) {
+			mutex_unlock(&dev->lock);
+			ret = -ENODEV;
+			break;
+		}
+		memcpy(bounce, dev->scratch + pos, len);
+		ue = pyrite_apply_faults(dev, bounce, pos, len);
+		if (ue) {
+			dev->health = PYRITE_HEALTH_XID;
+			dev->last_xid = PYRITE_XID_DBE;
+		}
+		mutex_unlock(&dev->lock);
+
+		if (ue) {
+			dev_warn(dev->device, "Xid %u: uncorrectable ECC error\n",
+				PYRITE_XID_DBE);
+			ret = -EIO;
+			break;
+		}
+
+		if (copy_to_user(ubuf + done, bounce, len)) {
+			ret = -EFAULT;
+			break;
+		}
+		done += len;
+		pos += len;
+	}
+
+	kfree(bounce);
+	*ppos = pos;
+
+	return done ? done : ret;
+}
+
+static ssize_t pyrite_write(struct file *filp, const char __user *ubuf,
+		size_t count, loff_t *ppos)
+{
+	struct pyrite_fctx *fctx = filp->private_data;
+	struct pyrite_dev *dev = fctx->dev;
+	loff_t pos = *ppos;
+	size_t done = 0;
+	ssize_t ret = 0;
+	void *bounce;
+
+	if (pos < 0)
+		return -EINVAL;
+	if (count == 0)
+		return 0;
+	if (pos >= pyrite_scratch_size)
+		return -ENOSPC;
+	count = min_t(size_t, count, pyrite_scratch_size - pos);
+
+	bounce = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+
+	while (done < count) {
+		size_t len = min_t(size_t, count - done, PAGE_SIZE - offset_in_page(pos));
+
+		if (copy_from_user(bounce, ubuf + done, len)) {
+			ret = -EFAULT;
+			break;
+		}
+
+		mutex_lock(&dev->lock);
+		if (dev->health == PYRITE_HEALTH_LOST) {
+			mutex_unlock(&dev->lock);
+			ret = -ENODEV;
+			break;
+		}
+		memcpy(dev->scratch + pos, bounce, len);
+		mutex_unlock(&dev->lock);
+
+		done += len;
+		pos += len;
+	}
+
+	kfree(bounce);
+	*ppos = pos;
+
+	return done ? done : ret;
+}
+
 static const struct file_operations pyrite_fops = {
 	.owner		= THIS_MODULE,
 	.open		= pyrite_open,
 	.release	= pyrite_release,
+	.llseek		= pyrite_llseek,
+	.read		= pyrite_read,
+	.write		= pyrite_write,
 	.unlocked_ioctl	= pyrite_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,
 };
+
+/* Split s at single spaces into exactly n words. */
+static int pyrite_split(char *s, char **words, int n)
+{
+	int i;
+
+	s = strim(s);
+	for (i = 0; i < n; i++) {
+		words[i] = strsep(&s, " ");
+		if (!words[i] || !*words[i])
+			return -EINVAL;
+	}
+
+	return s ? -EINVAL : 0;
+}
+
+/* "stuck <ce|ue|sdc> <offset> <bit> <0|1>" */
+static int pyrite_inject_stuck(struct pyrite_dev *dev, char *args)
+{
+	unsigned int off, bit, val;
+	char *w[4];
+	int ecc;
+	int ret = 0;
+
+	if (pyrite_split(args, w, 4))
+		return -EINVAL;
+	ecc = match_string(pyrite_ecc_names, PYRITE_ECC_NR, w[0]);
+	if (ecc < 0 ||
+			kstrtouint(w[1], 10, &off) || off >= pyrite_scratch_size ||
+			kstrtouint(w[2], 10, &bit) || bit > 7 ||
+			kstrtouint(w[3], 10, &val) || val > 1)
+		return -EINVAL;
+
+	mutex_lock(&dev->lock);
+	if (dev->nr_stuck == PYRITE_MAX_STUCK)
+		ret = -ENOSPC;
+	else
+		dev->stuck[dev->nr_stuck++] = (struct pyrite_stuck) {
+			.offset = off, .bit = bit, .value = val, .ecc = ecc,
+		};
+	mutex_unlock(&dev->lock);
+
+	if (!ret)
+		dev_info(dev->device, "stuck %s cell: byte %u bit %u reads %u\n",
+			pyrite_ecc_names[ecc], off, bit, val);
+	return ret;
+}
+
+/* "rate <ce|ue|sdc> <ppm>" */
+static int pyrite_inject_rate(struct pyrite_dev *dev, char *args)
+{
+	unsigned int ppm;
+	char *w[2];
+	int ecc;
+
+	if (pyrite_split(args, w, 2))
+		return -EINVAL;
+	ecc = match_string(pyrite_ecc_names, PYRITE_ECC_NR, w[0]);
+	if (ecc < 0 || kstrtouint(w[1], 10, &ppm) || ppm > PYRITE_PPM)
+		return -EINVAL;
+
+	mutex_lock(&dev->lock);
+	dev->rate[ecc] = ppm;
+	mutex_unlock(&dev->lock);
+
+	dev_info(dev->device, "%s errors at %u ppm per page read\n",
+		pyrite_ecc_names[ecc], ppm);
+	return 0;
+}
 
 static ssize_t pyrite_inject_write(struct file *filp, const char __user *ubuf,
 		size_t count, loff_t *ppos)
@@ -501,6 +850,7 @@ static ssize_t pyrite_inject_write(struct file *filp, const char __user *ubuf,
 	struct pyrite_dev *dev = filp->private_data;
 	char cmd[PYRITE_INJECT_MAX];
 	u32 xid;
+	int ret;
 
 	if (count >= sizeof(cmd))
 		return -EINVAL;
@@ -532,6 +882,20 @@ static ssize_t pyrite_inject_write(struct file *filp, const char __user *ubuf,
 		mutex_unlock(&dev->lock);
 
 		dev_info(dev->device, "reset\n");
+	} else if (str_has_prefix(cmd, "stuck ")) {
+		ret = pyrite_inject_stuck(dev, cmd + 6);
+		if (ret)
+			return ret;
+	} else if (str_has_prefix(cmd, "rate ")) {
+		ret = pyrite_inject_rate(dev, cmd + 5);
+		if (ret)
+			return ret;
+	} else if (sysfs_streq(cmd, "clear")) {
+		mutex_lock(&dev->lock);
+		pyrite_clear_faults(dev);
+		mutex_unlock(&dev->lock);
+
+		dev_info(dev->device, "memory faults cleared\n");
 	} else {
 		return -EINVAL;
 	}
@@ -544,6 +908,20 @@ static const struct file_operations pyrite_inject_fops = {
 	.open	= simple_open,
 	.write	= pyrite_inject_write,
 };
+
+static int sdc_count_show(struct seq_file *m, void *unused)
+{
+	struct pyrite_dev *dev = m->private;
+	u64 val;
+
+	mutex_lock(&dev->lock);
+	val = dev->sdc_count;
+	mutex_unlock(&dev->lock);
+
+	seq_printf(m, "%llu\n", val);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(sdc_count);
 
 /* Test-only fault injection; pyrite works the same without debugfs */
 static void pyrite_debugfs_init(void)
@@ -558,7 +936,18 @@ static void pyrite_debugfs_init(void)
 		dir = debugfs_create_dir(dev_name(devs[i].device), pyrite_debugfs);
 		debugfs_create_file("inject", 0200, dir, &devs[i],
 				&pyrite_inject_fops);
+		/* ground truth for tests, kept out of sysfs so no monitor sees it */
+		debugfs_create_file("sdc_count", 0400, dir, &devs[i],
+				&sdc_count_fops);
 	}
+}
+
+static void pyrite_free_scratch(void)
+{
+	int i;
+
+	for (i = 0; i < pyrite_ndev; i++)
+		kvfree(devs[i].scratch);
 }
 
 static int __init pyrite_init(void)
@@ -570,7 +959,13 @@ static int __init pyrite_init(void)
 		pr_err("ndev must be 1..%d\n", PYRITE_MAX_DEV);
 		return -EINVAL;
 	}
+	if (scratch_kb < PYRITE_SCRATCH_MIN_KB || scratch_kb > PYRITE_SCRATCH_MAX_KB) {
+		pr_err("scratch_kb must be %d..%d\n",
+			PYRITE_SCRATCH_MIN_KB, PYRITE_SCRATCH_MAX_KB);
+		return -EINVAL;
+	}
 	pyrite_ndev = ndev;
+	pyrite_scratch_size = (loff_t)scratch_kb << 10;
 
 	devs = kcalloc(pyrite_ndev, sizeof(*devs), GFP_KERNEL);
 	if (!devs)
@@ -600,13 +995,20 @@ static int __init pyrite_init(void)
 		prandom_bytes_state(&rnd, dev->uuid.b, UUID_SIZE);
 		dev->uuid.b[6] = (dev->uuid.b[6] & 0x0f) | 0x40;
 		dev->uuid.b[8] = (dev->uuid.b[8] & 0x3f) | 0x80;
+		pyrite_clear_faults(dev);
+
+		dev->scratch = kvzalloc(pyrite_scratch_size, GFP_KERNEL);
+		if (!dev->scratch) {
+			ret = -ENOMEM;
+			goto err_free_scratch;
+		}
 	}
 
 	cdev_init(&pyrite_cdev, &pyrite_fops);
 	pyrite_cdev.owner = THIS_MODULE;
 	ret = cdev_add(&pyrite_cdev, pyrite_devt, pyrite_ndev);
 	if (ret)
-		goto err_unreg_region;
+		goto err_free_scratch;
 
 	pyrite_class = class_create("pyrite");
 	if (IS_ERR(pyrite_class)) {
@@ -640,7 +1042,8 @@ err_destroy_devices:
 	class_destroy(pyrite_class);
 err_del_cdev:
 	cdev_del(&pyrite_cdev);
-err_unreg_region:
+err_free_scratch:
+	pyrite_free_scratch();
 	unregister_chrdev_region(pyrite_devt, pyrite_ndev);
 err_free_devs:
 	kfree(devs);
@@ -662,6 +1065,7 @@ static void __exit pyrite_exit(void)
 	cdev_del(&pyrite_cdev);
 	unregister_chrdev_region(pyrite_devt, pyrite_ndev);
 
+	pyrite_free_scratch();
 	kfree(devs);
 
 	pr_info("unloaded\n");
