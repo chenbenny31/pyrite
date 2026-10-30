@@ -4,8 +4,9 @@ pyrite lets you test a GPU scheduler on a machine with no GPUs. Each
 `/dev/pyriteN` is a mock GPU with a fixed VRAM capacity. It accepts or refuses
 allocations in 2 MiB units and reports usage per process (tgid) through
 `ioctl` and sysfs. When a client dies, even by `SIGKILL`, the kernel frees
-everything it allocated. A test can also make a device fail on cue, with an Xid
-error or by falling off the bus, and check that the scheduler stops using it.
+everything it allocated. A test can also make a device fail on cue, from an Xid
+error to memory that silently returns wrong data, and check that the scheduler
+and its health checks catch it.
 
 In a guest, with the module and `tests/hold` built:
 
@@ -17,12 +18,12 @@ kill -9 %1
 cat /sys/class/pyrite/pyrite0/used_mb    # 0
 ```
 
-**Status:** the module, its UAPI header, a nine-test harness and `tests/run.sh`
-are done, including device health and fault injection. The tests pass on the
-plain kernel and on a debug kernel with KASAN, lockdep and kmemleak. A
-[Kubernetes device plugin](#kubernetes) hands the devices to pods in a k3s VM
-and stops handing out a device once it fails. [Planned](#planned) lists what
-comes next.
+**Status:** the module, its UAPI header, a 15-test harness and `tests/run.sh`
+are done, including device health, scratch memory and fault injection. The
+tests pass on the plain kernel and on a debug kernel with KASAN, lockdep and
+kmemleak. A [Kubernetes device plugin](#kubernetes) hands the devices to pods
+in a k3s VM and stops handing out a device once it fails. [Planned](#planned)
+lists what comes next.
 
 ## How it differs
 
@@ -34,7 +35,7 @@ holding some, or a GPU that fails under a running job, can't be tested.
 | Core decision | What a test gets | What the alternatives do |
 | --- | --- | --- |
 | The ledger is in a kernel module | one view of usage per device and per process, shared by every process on the node; the kernel frees a client's memory when its last descriptor closes, even after `SIGKILL` | fake-GPU device plugins and KWOK keep no per-process state; NVML mocks keep it inside one test process |
-| Faults change what calls return | after an injected Xid, ALLOC fails with `EIO`; a lost GPU fails every ioctl with `ENODEV`; `health` and dmesg show the fault | a fake plugin can report a device Unhealthy, but a job already on it never sees an error |
+| Faults change what calls return | after an injected Xid, ALLOC fails with `EIO`; a lost GPU fails every ioctl with `ENODEV`; a stuck memory bit returns wrong data that only a known-answer test catches | a fake plugin can report a device Unhealthy, but a job already on it never sees an error, and there is no memory to corrupt |
 | It runs under a real kubelet | pods are real processes that open `/dev/pyriteN`, handed out by a device plugin that keys devices by UUID | KWOK simulates nodes and pods without running them |
 
 pyrite stops at accounting. It reserves no memory and runs no GPU code, and
@@ -74,13 +75,14 @@ cannot see its devices.
 
 ## Devices and parameters
 
-`insmod` takes three parameters:
+`insmod` takes four parameters:
 
 | Parameter | Meaning |
 | --- | --- |
 | `ndev` | number of devices, 1..16, default 4 |
 | `capacity_mb` | capacity per device in MiB; `0` or unset means 8192 |
 | `uuid_seed` | seed for device UUIDs, default 0 |
+| `scratch_kb` | [scratch memory](#scratch-memory) per device in KiB, 4..16384, default 1024 |
 
 Each device gets these read-only attributes under `/sys/class/pyrite/pyriteN/`:
 
@@ -94,6 +96,9 @@ Each device gets these read-only attributes under `/sys/class/pyrite/pyriteN/`:
 | `uuid` | `GPU-` plus a version 4 UUID |
 | `health` | `ok`, `xid` or `lost`; see [Faults](#faults) |
 | `last_xid` | last injected Xid code; `0` if none since load or reset |
+| `scratch_kb` | scratch memory size in KiB |
+| `ecc_ce_count` | corrected memory errors since load or `clear` |
+| `ecc_ue_count` | uncorrected memory errors since load or `clear` |
 
 `numa_node` and `pcie_addr` are fake. They are there because discovery code
 expects them.
@@ -140,6 +145,19 @@ used `0xB7`, but `nsfs.h` and `remoteproc_cdev.h` already use that one.
   word, so after a layout change old callers get `ENOTTY` instead of corrupt
   data.
 
+## Scratch memory
+
+Each device also has a block of memory, `scratch_kb` in size, that a test reads
+and writes with `read`, `write`, `pread` and `pwrite` on `/dev/pyriteN`. It is
+there so memory errors have somewhere to show up. It is a plain kernel buffer,
+separate from the ALLOC ledger and never mapped. Everyone who opens the device
+shares it, so only one tester at a time should use it.
+
+A read at or past the end returns 0, and a write there returns `ENOSPC`.
+`lseek` with `SEEK_END` gives the size. A `lost` device fails reads and writes
+with `ENODEV`; an `xid` device still allows them, so it can be tested after a
+fault.
+
 ## Faults
 
 A real GPU can't be made to fail at a chosen point in a test. With pyrite, root
@@ -177,6 +195,37 @@ reported before health.
 The `inject` file is in debugfs because it is a test knob and stays out of the
 ABI. Without debugfs, pyrite works the same but can't fake faults.
 
+### Memory errors
+
+The same `inject` file plants errors in scratch memory. Each error has a class,
+which decides what a reader sees:
+
+| Class | What a read returns | What pyrite reports |
+| --- | --- | --- |
+| `ce` (corrected) | the right data | `ecc_ce_count` goes up |
+| `ue` (uncorrected) | `EIO` | `ecc_ue_count` goes up; health `xid` with `last_xid` 48, NVIDIA's Xid for an uncorrectable ECC error; `Xid 48` in dmesg |
+| `sdc` (silent) | wrong data | nothing |
+
+| Command | Effect |
+| --- | --- |
+| `stuck <class> <offset> <bit> <0\|1>` | that bit always reads as the given value; up to 64 cells per device |
+| `rate <class> <ppm>` | each 4 KiB page read has a ppm/1,000,000 chance of one random bit error; `0` turns it off |
+| `clear` | removes all memory errors and zeroes the counters |
+
+A write stores what it was given, and errors apply only to what a read returns.
+A stuck cell shows only when the stored bit differs from its stuck value, so a
+stuck-at-1 bit hides under `0xFF`. A memory test therefore needs a pattern and
+its inverse, as real ones do. `reset` leaves memory errors in place, because a
+GPU reset doesn't fix bad memory; `clear` stands for replacing the card.
+
+A known-answer test has to find silent errors on its own, since pyrite reports
+nothing. To check such a test, `/sys/kernel/debug/pyrite/pyriteN/sdc_count`
+counts the silent bit errors pyrite has handed to readers. It lives in debugfs,
+out of reach of the plugin and other monitors.
+
+Random errors come from a stream seeded from the device's UUID, and `clear`
+restarts it, so the same reads in the same order give the same errors.
+
 ## Design notes
 
 - One `cdev` covers all `ndev` minors. Each device has its own ledger and one
@@ -200,6 +249,9 @@ ABI. Without debugfs, pyrite works the same but can't fake faults.
   Release does not change it.
 - debugfs is created last in init and removed first in exit. `debugfs_remove`
   waits for writes in progress, so no `inject` write can touch a freed device.
+- Scratch reads and writes go one 4 KiB page at a time through a bounce page,
+  so the copy rule above holds for them too. Memory errors are applied to the
+  bounce copy under the lock, and the buffer keeps what was written.
 
 ## Build and run
 
@@ -278,11 +330,17 @@ run on the wrong kernel cannot pass.
 | `t_uuid` | 0–3 | every `uuid` is well-formed, the four differ, and a second read matches |
 | `t_xid` | 1 | after `xid 48`, `health` and `last_xid` read back, ALLOC returns `EIO`, QUERY_DEVICE and FREE work, and `xid`, `xid 0` and `bogus` return `EINVAL`; after `reset`, ALLOC works |
 | `t_lost` | 2 | after `lost`, all four ioctls return `ENODEV`; closing the descriptor still brings `used_mb` to 0 |
+| `t_scratch_rw` | 3 | data reads back across a page boundary and at the last byte; EOF at the end and `ENOSPC` past it; a `lost` device fails reads and writes with `ENODEV` |
+| `t_sdc` | 3 | a stuck-at-1 bit turns `0x00` into `0x08` with no counter or health change while `sdc_count` reads 1; under `0xFF` it shows nothing; `clear` removes it |
+| `t_ce` | 3 | a stuck corrected bit reads back right, and `ecc_ce_count` goes up once per read |
+| `t_ue` | 3 | a matching bit reads fine; a mismatched one fails with `EIO`, raises `ecc_ue_count` and sets health `xid`/48; the next page still reads |
+| `t_rate` | 3 | at 1,000,000 ppm a page of zeros reads back with exactly one bit set; at 0 it reads back clean |
+| `t_fault_cmds` | 3 | malformed `stuck` and `rate` commands return `EINVAL`, and a 65th stuck cell returns `ENOSPC` |
 
 The harness needs a fresh load with at least four devices, because it opens
 `/dev/pyrite0` to `/dev/pyrite3` directly and checks exact `used_mb` values.
-`t_xid` and `t_lost` also need debugfs, which `run.sh` mounts. Both close their
-descriptor and reset the device on every exit path.
+The fault tests also need debugfs, which `run.sh` mounts. Each one resets or
+clears its device on every exit path.
 
 `t_kill_cleanup` also prints the reclaim latency. In recorded runs it stayed
 under 0.2 ms on the plain kernel and under 1.2 ms on the debug kernel. The
@@ -301,6 +359,10 @@ and run on the debug kernel. Every run failed:
 | release uncharges its allocations but skips `kfree` | kmemleak only; every harness test passed |
 | QUERY_DEVICE takes the mutex with preemption off | `DEBUG_ATOMIC_SLEEP` |
 | ALLOC takes the next device's lock inside its own | lockdep |
+
+The memory-error tests were checked the same way on the plain kernel. Each of
+eight planted bugs, such as an SDC that never flips its bit or a UE that leaves
+health alone, failed the test written for it.
 
 ## Kubernetes
 
@@ -381,7 +443,6 @@ The rest of the Kubernetes work is not written yet. In order:
 
 | Step | What it adds |
 | --- | --- |
-| Silent data corruption | a small scratch buffer per device that tests write and read back, with injected corrected, uncorrected and silent bit flips, and ECC counters in sysfs |
 | Qualification | `tools/qualify` writes known patterns and checks them; a controller taints a failing node, runs the check as a Job, and removes the taint when it passes. `reset` will refuse a device that still has allocations, like `nvidia-smi -r` |
 | Experiment | inject faults at set rates and measure detection latency, false positives, missed faults and capacity lost to quarantine |
 
@@ -410,7 +471,8 @@ last. MIG/MPS, memory mapping, thermals and topology are not planned.
 
 pyrite only does GPU-shaped accounting. It has none of a real GPU driver's
 DRM/TTM, GEM objects, DMA, interrupts or submission ring, and it maps no
-memory. `util` is a synthetic number with no fairness or isolation behind it.
+memory. Scratch memory is a small kernel buffer for memory tests, not VRAM.
+`util` is a synthetic number with no fairness or isolation behind it.
 The UAPI can change at any time. Load it only in a disposable VM.
 
 ## Repository layout
@@ -419,7 +481,7 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | --- | --- |
 | `pyrite.c` | the module |
 | `uapi/pyrite.h` | ioctl structs and commands, shared with userspace |
-| `tests/harness.c` | nine-test harness |
+| `tests/harness.c` | 15-test harness |
 | `tests/run.sh` | in-guest gate: load, test, unload, check `dmesg`, lockdep and kmemleak |
 | `tests/hold.c` | reclaim demo from the top of this README |
 | `deviceplugin/` | Kubernetes device plugin (Go), its image, DaemonSet and end-to-end test |
