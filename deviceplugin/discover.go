@@ -13,8 +13,9 @@ import (
 
 // Device is one pyrite device as the plugin advertises it.
 type Device struct {
-	ID   string // sysfs uuid, e.g. "GPU-20081800-c819-4400-a406-204214828200"
-	Path string // "/dev/pyriteN"
+	ID         string // sysfs uuid, e.g. "GPU-20081800-c819-4400-a406-204214828200"
+	Path       string // "/dev/pyriteN"
+	HealthFile string // sysfs health file: "ok", "xid" or "lost"
 }
 
 // Discover reads <sysClass>/pyriteN/uuid for N = 0, 1, ... until one is
@@ -32,8 +33,9 @@ func Discover(sysClass string) ([]Device, error) {
 			return nil, err
 		}
 		devs = append(devs, Device{
-			ID:   strings.TrimSpace(string(uuid)),
-			Path: "/dev/" + name,
+			ID:         strings.TrimSpace(string(uuid)),
+			Path:       "/dev/" + name,
+			HealthFile: filepath.Join(sysClass, name, "health"),
 		})
 	}
 

@@ -10,6 +10,7 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
+	"time"
 
 	pluginapi "k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1"
 )
@@ -17,6 +18,7 @@ import (
 func main() {
 	sysClass := flag.String("sysfs", "/sys/class/pyrite", "pyrite's sysfs class directory")
 	pluginDir := flag.String("plugin-dir", pluginapi.DevicePluginPath, "kubelet's device plugin directory")
+	interval := flag.Duration("interval", time.Second, "how often to read device health and check the plugin socket")
 	flag.Parse()
 
 	devs, err := Discover(*sysClass)
@@ -30,7 +32,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := New(devs, *pluginDir).Run(ctx); err != nil {
+	if err := New(devs, *pluginDir, *interval).Run(ctx); err != nil {
 		log.Fatal(err)
 	}
 }

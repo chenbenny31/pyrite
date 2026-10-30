@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -32,20 +34,21 @@ type Plugin struct {
 	devs      []Device
 	byID      map[string]Device
 	pluginDir string
+	interval  time.Duration // health reads and socket checks
 }
 
-func New(devs []Device, pluginDir string) *Plugin {
+func New(devs []Device, pluginDir string, interval time.Duration) *Plugin {
 	byID := make(map[string]Device, len(devs))
 	for _, d := range devs {
 		byID[d.ID] = d
 	}
-	return &Plugin{devs: devs, byID: byID, pluginDir: pluginDir}
+	return &Plugin{devs: devs, byID: byID, pluginDir: pluginDir, interval: interval}
 }
 
 // Run serves on <pluginDir>/pyrite.sock and registers with kubelet. kubelet
 // deletes plugin sockets when it restarts, so Run checks for its socket every
-// second and serves and registers again once it is gone. Run returns nil when
-// ctx is done, and an error if serving or registering fails.
+// interval and serves and registers again once it is gone. Run returns nil
+// when ctx is done, and an error if serving or registering fails.
 func (p *Plugin) Run(ctx context.Context) error {
 	sock := filepath.Join(p.pluginDir, socketName)
 	for {
@@ -59,7 +62,7 @@ func (p *Plugin) Run(ctx context.Context) error {
 		}
 		log.Printf("registered %d device(s) as %s", len(p.devs), resourceName)
 
-		gone := waitGone(ctx, sock)
+		gone := waitGone(ctx, sock, p.interval)
 		srv.Stop()
 		if !gone {
 			return nil
@@ -105,8 +108,8 @@ func (p *Plugin) register(ctx context.Context) error {
 }
 
 // waitGone returns true once sock no longer exists, or false when ctx is done.
-func waitGone(ctx context.Context, sock string) bool {
-	tick := time.NewTicker(time.Second)
+func waitGone(ctx context.Context, sock string, interval time.Duration) bool {
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
 		select {
@@ -124,19 +127,68 @@ func (p *Plugin) GetDevicePluginOptions(context.Context, *pluginapi.Empty) (*plu
 	return &pluginapi.DevicePluginOptions{}, nil
 }
 
-// ListAndWatch sends every device as Healthy once, then keeps the stream open
-// until kubelet or Run closes it.
-func (p *Plugin) ListAndWatch(_ *pluginapi.Empty, stream grpc.ServerStreamingServer[pluginapi.ListAndWatchResponse]) error {
-	resp := &pluginapi.ListAndWatchResponse{}
-	for _, d := range p.devs {
-		resp.Devices = append(resp.Devices, &pluginapi.Device{ID: d.ID, Health: pluginapi.Healthy})
+// readHealth returns what each device's health file says, or the read error,
+// in device order.
+func (p *Plugin) readHealth() []string {
+	got := make([]string, len(p.devs))
+	for i, d := range p.devs {
+		b, err := os.ReadFile(d.HealthFile)
+		if err != nil {
+			got[i] = err.Error()
+		} else {
+			got[i] = strings.TrimSpace(string(b))
+		}
 	}
-	if err := stream.Send(resp); err != nil {
-		return err
-	}
+	return got
+}
 
-	<-stream.Context().Done()
-	return nil
+// kubeHealth maps a health file reading to kubelet's terms. Only "ok" is
+// Healthy; "xid", "lost" and failed reads are all Unhealthy.
+func kubeHealth(reading string) string {
+	if reading == "ok" {
+		return pluginapi.Healthy
+	}
+	return pluginapi.Unhealthy
+}
+
+// ListAndWatch sends every device's health at once, then reads it again every
+// interval and sends the whole list whenever a reading changes. Each stream
+// polls on its own, so streams share nothing. It returns when kubelet or Run
+// closes the stream.
+func (p *Plugin) ListAndWatch(_ *pluginapi.Empty, stream grpc.ServerStreamingServer[pluginapi.ListAndWatchResponse]) error {
+	tick := time.NewTicker(p.interval)
+	defer tick.Stop()
+
+	// Starting from all "ok" logs only the devices that start unhealthy
+	last := make([]string, len(p.devs))
+	for i := range last {
+		last[i] = "ok"
+	}
+	first := true
+
+	for {
+		got := p.readHealth()
+		if first || !slices.Equal(got, last) {
+			resp := &pluginapi.ListAndWatchResponse{}
+			for i, d := range p.devs {
+				h := kubeHealth(got[i])
+				if got[i] != last[i] {
+					log.Printf("%s %s: %s (%s)", d.Path, d.ID, h, got[i])
+				}
+				resp.Devices = append(resp.Devices, &pluginapi.Device{ID: d.ID, Health: h})
+			}
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+			last, first = got, false
+		}
+
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-tick.C:
+		}
+	}
 }
 
 // Allocate gives each container the device nodes it asked for, at the same

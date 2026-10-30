@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,9 +24,12 @@ import (
 const (
 	uuid0 = "GPU-0e108210-008a-4001-ae40-008982159000"
 	uuid1 = "GPU-c9a21ac0-8120-4d83-a878-00856245a060"
+
+	interval = 10 * time.Millisecond
 )
 
-// fakeSysfs makes <tmp>/pyriteN/uuid for each uuid, with sysfs's trailing newline.
+// fakeSysfs makes <tmp>/pyriteN/uuid for each uuid, and a health file that
+// reads "ok", both with sysfs's trailing newline.
 func fakeSysfs(t *testing.T, uuids ...string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -37,16 +41,29 @@ func fakeSysfs(t *testing.T, uuids ...string) string {
 		if err := os.WriteFile(filepath.Join(d, "uuid"), []byte(u+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		setHealth(t, dir, i, "ok")
 	}
 	return dir
 }
 
+func setHealth(t *testing.T, sysClass string, i int, h string) {
+	t.Helper()
+	f := filepath.Join(sysClass, fmt.Sprintf("pyrite%d", i), "health")
+	if err := os.WriteFile(f, []byte(h+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDiscover(t *testing.T) {
-	devs, err := Discover(fakeSysfs(t, uuid0, uuid1))
+	sys := fakeSysfs(t, uuid0, uuid1)
+	devs, err := Discover(sys)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Device{{uuid0, "/dev/pyrite0"}, {uuid1, "/dev/pyrite1"}}
+	want := []Device{
+		{uuid0, "/dev/pyrite0", filepath.Join(sys, "pyrite0", "health")},
+		{uuid1, "/dev/pyrite1", filepath.Join(sys, "pyrite1", "health")},
+	}
 	if fmt.Sprint(devs) != fmt.Sprint(want) {
 		t.Fatalf("got %v, want %v", devs, want)
 	}
@@ -107,17 +124,17 @@ func dialPlugin(t *testing.T, dir string) pluginapi.DevicePluginClient {
 	return pluginapi.NewDevicePluginClient(conn)
 }
 
-// startPlugin runs a plugin for uuid0 and uuid1 in dir. The returned function
-// stops it and fails the test unless Run returns nil within 5 s.
-func startPlugin(t *testing.T, dir string) func() {
+// startPlugin runs a plugin in dir for the devices in sysClass. The returned
+// function stops it and fails the test unless Run returns nil within 5 s.
+func startPlugin(t *testing.T, dir, sysClass string) func() {
 	t.Helper()
-	devs, err := Discover(fakeSysfs(t, uuid0, uuid1))
+	devs, err := Discover(sysClass)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- New(devs, dir).Run(ctx) }()
+	go func() { done <- New(devs, dir, interval).Run(ctx) }()
 
 	return func() {
 		cancel()
@@ -132,10 +149,36 @@ func startPlugin(t *testing.T, dir string) func() {
 	}
 }
 
+// healths is the health of each device in a ListAndWatch response, e.g.
+// "Healthy Unhealthy"
+func healths(lw *pluginapi.ListAndWatchResponse) string {
+	var hs []string
+	for _, d := range lw.Devices {
+		hs = append(hs, d.Health)
+	}
+	return strings.Join(hs, " ")
+}
+
+// recvUntil reads ListAndWatch responses until one has the wanted healths.
+// os.WriteFile truncates before it writes, so a read in between sees an
+// empty file and a response may show an extra Unhealthy on the way.
+func recvUntil(t *testing.T, stream grpc.ServerStreamingClient[pluginapi.ListAndWatchResponse], want string) {
+	t.Helper()
+	for {
+		lw, err := stream.Recv()
+		if err != nil {
+			t.Fatalf("waiting for %q: %v", want, err)
+		}
+		if healths(lw) == want {
+			return
+		}
+	}
+}
+
 func TestPlugin(t *testing.T) {
 	dir := t.TempDir()
 	k := startKubelet(t, dir)
-	stop := startPlugin(t, dir)
+	stop := startPlugin(t, dir, fakeSysfs(t, uuid0, uuid1))
 
 	req := k.wait(t)
 	if req.Version != pluginapi.Version || req.Endpoint != socketName || req.ResourceName != resourceName {
@@ -207,7 +250,7 @@ func TestPlugin(t *testing.T) {
 func TestReregister(t *testing.T) {
 	dir := t.TempDir()
 	k := startKubelet(t, dir)
-	stop := startPlugin(t, dir)
+	stop := startPlugin(t, dir, fakeSysfs(t, uuid0, uuid1))
 	defer stop()
 
 	k.wait(t)
@@ -225,4 +268,44 @@ func TestReregister(t *testing.T) {
 	if lw, err := stream.Recv(); err != nil || len(lw.Devices) != 2 {
 		t.Fatalf("ListAndWatch after re-register: %v, %v", lw, err)
 	}
+}
+
+// Only "ok" is Healthy; xid, lost and a missing health file are Unhealthy,
+// and every change is sent
+func TestHealth(t *testing.T) {
+	dir := t.TempDir()
+	sys := fakeSysfs(t, uuid0, uuid1)
+	setHealth(t, sys, 1, "xid")
+	k := startKubelet(t, dir)
+	stop := startPlugin(t, dir, sys)
+	defer stop()
+	k.wait(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := dialPlugin(t, dir).ListAndWatch(ctx, &pluginapi.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lw, err := stream.Recv()
+	if err != nil || healths(lw) != "Healthy Unhealthy" {
+		t.Fatalf("first ListAndWatch: %v, %v; want device 1 Unhealthy from the start", lw, err)
+	}
+
+	setHealth(t, sys, 0, "lost")
+	recvUntil(t, stream, "Unhealthy Unhealthy")
+
+	setHealth(t, sys, 0, "ok")
+	setHealth(t, sys, 1, "ok")
+	recvUntil(t, stream, "Healthy Healthy")
+
+	// what the plugin sees while the module is unloaded
+	if err := os.Remove(filepath.Join(sys, "pyrite1", "health")); err != nil {
+		t.Fatal(err)
+	}
+	recvUntil(t, stream, "Healthy Unhealthy")
+
+	setHealth(t, sys, 1, "ok")
+	recvUntil(t, stream, "Healthy Healthy")
 }

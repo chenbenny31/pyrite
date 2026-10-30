@@ -20,8 +20,9 @@ cat /sys/class/pyrite/pyrite0/used_mb    # 0
 **Status:** the module, its UAPI header, a nine-test harness and `tests/run.sh`
 are done, including device health and fault injection. The tests pass on the
 plain kernel and on a debug kernel with KASAN, lockdep and kmemleak. A
-[Kubernetes device plugin](#kubernetes) hands the devices to pods in a k3s VM.
-[Planned](#planned) lists what comes next.
+[Kubernetes device plugin](#kubernetes) hands the devices to pods in a k3s VM
+and stops handing out a device once it fails. [Planned](#planned) lists what
+comes next.
 
 ## How it differs
 
@@ -318,8 +319,20 @@ uses GPU UUIDs. kubelet records the IDs it hands out, and the seeded UUIDs keep
 them valid after a module reload. kubelet deletes plugin sockets when it
 restarts, so the plugin checks for its socket every second and registers again
 once it is gone. The plugin never opens a device, so its DaemonSet is not
-privileged and mounts only kubelet's device plugin directory. For now every
-device is reported Healthy.
+privileged and mounts only kubelet's device plugin directory.
+
+The plugin reads each device's `health` file once a second (`-interval`) and
+tells kubelet when it changes. Only `ok` counts as Healthy; `xid`, `lost` and a
+failed read, as while the module is unloaded, are Unhealthy. kubelet then stops
+counting the device as allocatable, so no new pod gets it. A pod already on it
+keeps running, and kubelet marks the device Unhealthy in the pod's
+`status.containerStatuses[].allocatedResourcesStatus`. That pod still holds its
+request, and the scheduler counts it against the lower allocatable, so a node
+with a failed GPU under a running pod has two GPUs to give out, not three,
+until the pod goes away. kubelet posts node status every 10 s, so the scheduler
+can see a fault up to about 11 s after it happens, while the plugin sees it
+within a second. Reloading the module with the same `uuid_seed` keeps the
+device IDs; a different seed needs a plugin restart.
 
 `vm/vm.sh` runs a single-node k3s cluster in a QEMU VM with Fedora 44 Cloud.
 kind would use the host kernel, and virtme-ng shares the host's root
@@ -351,6 +364,16 @@ checks that:
 - deleting the 1-GPU pod brings every device back to 0 MiB
 - after `systemctl restart k3s`, the plugin registers again without being
   restarted, allocatable returns to 4, and a new pod gets a device
+- after `xid 48` on the 1-GPU pod's device, allocatable drops to 3, the pod
+  keeps running and its status shows the device Unhealthy; a 2-GPU pod runs on
+  healthy devices, and a 3-GPU pod stays Pending because the pod on the failed
+  device still counts
+- `reset` brings allocatable back to 4, and `lost` on another device drops it
+  to 3 until the next `reset`
+- unloading the module drops allocatable to 0, and loading it again brings all
+  four back without restarting the plugin
+
+The test also prints how long the plugin and the node took to notice the Xid.
 
 ## Planned
 
@@ -358,7 +381,6 @@ The rest of the Kubernetes work is not written yet. In order:
 
 | Step | What it adds |
 | --- | --- |
-| Health in the plugin | the plugin polls `health` and reports a failed device as Unhealthy, so kubelet stops giving it to new pods |
 | Silent data corruption | a small scratch buffer per device that tests write and read back, with injected corrected, uncorrected and silent bit flips, and ECC counters in sysfs |
 | Qualification | `tools/qualify` writes known patterns and checks them; a controller taints a failing node, runs the check as a Job, and removes the taint when it passes. `reset` will refuse a device that still has allocations, like `nvidia-smi -r` |
 | Experiment | inject faults at set rates and measure detection latency, false positives, missed faults and capacity lost to quarantine |
