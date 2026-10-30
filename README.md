@@ -19,8 +19,29 @@ cat /sys/class/pyrite/pyrite0/used_mb    # 0
 
 **Status:** the module, its UAPI header, a nine-test harness and `tests/run.sh`
 are done, including device health and fault injection. The tests pass on the
-plain kernel and on a debug kernel with KASAN, lockdep and kmemleak.
+plain kernel and on a debug kernel with KASAN, lockdep and kmemleak. A
+[Kubernetes device plugin](#kubernetes) hands the devices to pods in a k3s VM.
 [Planned](#planned) lists what comes next.
+
+## How it differs
+
+pyrite's devices keep state that real processes change. Most other ways to test
+a GPU scheduler without GPUs fake only what the scheduler reads, such as the GPU
+count. No process can hold memory on those GPUs, so a job that dies while
+holding some, or a GPU that fails under a running job, can't be tested.
+
+| Core decision | What a test gets | What the alternatives do |
+| --- | --- | --- |
+| The ledger is in a kernel module | one view of usage per device and per process, shared by every process on the node; the kernel frees a client's memory when its last descriptor closes, even after `SIGKILL` | fake-GPU device plugins and KWOK keep no per-process state; NVML mocks keep it inside one test process |
+| Faults change what calls return | after an injected Xid, ALLOC fails with `EIO`; a lost GPU fails every ioctl with `ENODEV`; `health` and dmesg show the fault | a fake plugin can report a device Unhealthy, but a job already on it never sees an error |
+| It runs under a real kubelet | pods are real processes that open `/dev/pyriteN`, handed out by a device plugin that keys devices by UUID | KWOK simulates nodes and pods without running them |
+
+pyrite stops at accounting. It reserves no memory and runs no GPU code, and
+NVML, CUDA and `nvidia-smi` can't see its devices, so a scheduler needs a small
+backend for pyrite's ioctls and sysfs. It also enforces nothing on real GPUs;
+the `dmem` cgroup controller and CUDA interception do that.
+[Related work](#related-work) compares these tools in more detail, and
+[Limits](#limits) lists what pyrite leaves out.
 
 ## Why a kernel module
 
@@ -280,14 +301,63 @@ and run on the debug kernel. Every run failed:
 | QUERY_DEVICE takes the mutex with preemption off | `DEBUG_ATOMIC_SLEEP` |
 | ALLOC takes the next device's lock inside its own | lockdep |
 
+## Kubernetes
+
+`deviceplugin/` is a Kubernetes device plugin, written in Go, that advertises
+each pyrite device as `pyrite.dev/gpu`. A pod that asks for one gets a single
+`/dev/pyriteN`, at the same path as on the host:
+
+```yaml
+resources:
+  limits:
+    pyrite.dev/gpu: 1
+```
+
+The plugin uses each device's `uuid` as its device ID, the way NVIDIA's plugin
+uses GPU UUIDs. kubelet records the IDs it hands out, and the seeded UUIDs keep
+them valid after a module reload. kubelet deletes plugin sockets when it
+restarts, so the plugin checks for its socket every second and registers again
+once it is gone. The plugin never opens a device, so its DaemonSet is not
+privileged and mounts only kubelet's device plugin directory. For now every
+device is reported Healthy.
+
+`vm/vm.sh` runs a single-node k3s cluster in a QEMU VM with Fedora 44 Cloud.
+kind would use the host kernel, and virtme-ng shares the host's root
+filesystem, so neither can host the cluster. `provision` builds pyrite in the
+VM against Fedora's kernel, runs the harness there, loads the module at boot
+with `uuid_seed=1`, and installs k3s. SELinux is permissive in the VM, because
+k3s on Fedora otherwise needs Rancher's policy package. The host needs QEMU
+with KVM, xorriso, gpg, podman and Go.
+
+| Step | Command |
+| --- | --- |
+| Boot the VM (downloads the image the first time) | `vm/vm.sh up` |
+| Build and test pyrite in the VM, load it, install k3s | `vm/vm.sh provision` |
+| Plugin unit tests | `make -C deviceplugin test` |
+| End-to-end test | `deviceplugin/e2e/run.sh` |
+| Shell in the VM | `vm/vm.sh ssh` |
+| Stop the VM, or delete its disk | `vm/vm.sh down`, `vm/vm.sh destroy` |
+
+All commands run on the host. VM files go in `./.vm` and Go caches in
+`./.cache/go`; git ignores both.
+
+`e2e/run.sh` builds the plugin image and an image with `tests/hold`, copies
+both into k3s's containerd (there is no registry), deploys the DaemonSet and
+checks that:
+
+- allocatable `pyrite.dev/gpu` reaches 4
+- a 1-GPU pod sees exactly one `/dev/pyrite*`, and one device shows 2 MiB used
+- a 5-GPU pod stays Pending
+- deleting the 1-GPU pod brings every device back to 0 MiB
+- after `systemctl restart k3s`, the plugin registers again without being
+  restarted, allocatable returns to 4, and a new pod gets a device
+
 ## Planned
 
-The next steps make Kubernetes pyrite's first user. None of them is written
-yet. In order:
+The rest of the Kubernetes work is not written yet. In order:
 
 | Step | What it adds |
 | --- | --- |
-| Device plugin | a Go DaemonSet in a k3s VM that advertises each device as `pyrite.dev/gpu`, keyed by UUID, and mounts `/dev/pyriteN` into the pod |
 | Health in the plugin | the plugin polls `health` and reports a failed device as Unhealthy, so kubelet stops giving it to new pods |
 | Silent data corruption | a small scratch buffer per device that tests write and read back, with injected corrected, uncorrected and silent bit flips, and ECC counters in sysfs |
 | Qualification | `tools/qualify` writes known patterns and checks them; a controller taints a failing node, runs the check as a Job, and removes the taint when it passes. `reset` will refuse a device that still has allocations, like `nvidia-smi -r` |
@@ -311,6 +381,8 @@ last. MIG/MPS, memory mapping, thermals and topology are not planned.
 | `dmem` cgroup controller | limits and accounts device memory for DRM drivers through cgroups | enforces nothing outside its own devices; it only keeps a ledger |
 | CUDA interception (e.g. HAMi-core) | limits VRAM by hooking the CUDA driver API with `LD_PRELOAD`, inside each client | accounting and reclaim live in the kernel, and CUDA is not involved |
 | Kubernetes fake-GPU device plugins | advertise synthetic GPUs to the scheduler | keeps allocation state that survives a client's death; these plugins usually fake inventory only |
+| KWOK | simulates nodes and pods for the control plane; no kubelet runs them | pods are real processes holding real device files |
+| NVML mocks | replace NVML calls inside one test process | one ledger in the kernel, shared by every process on the node |
 
 ## Limits
 
@@ -328,6 +400,8 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | `tests/harness.c` | nine-test harness |
 | `tests/run.sh` | in-guest gate: load, test, unload, check `dmesg`, lockdep and kmemleak |
 | `tests/hold.c` | reclaim demo from the top of this README |
+| `deviceplugin/` | Kubernetes device plugin (Go), its image, DaemonSet and end-to-end test |
+| `vm/vm.sh` | single-node k3s VM for the plugin |
 | `Kbuild`, `Makefile` | out-of-tree build and `checkpatch` |
 
 ## License
