@@ -21,6 +21,8 @@ podman save localhost/pyrite-qualifier:dev |
 rc=0
 "$VM" ssh sh -s < "$R/qualifier/e2e/checks.sh" || rc=$?
 
+# The test's pod may still wait for a device if a check failed early
+"$VM" ssh k3s kubectl delete pod qhold --ignore-not-found --wait > /dev/null
 "$VM" ssh k3s kubectl delete -f - < "$R/qualifier/deploy/qualifier.yaml" > /dev/null
 "$VM" ssh sudo rm -f /var/lib/pyrite/quarantine
 exit "$rc"
