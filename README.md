@@ -419,22 +419,27 @@ can see a fault up to about 11 s after it happens, while the plugin sees it
 within a second. Reloading the module with the same `uuid_seed` keeps the
 device IDs; a different seed needs a plugin restart.
 
-`vm/vm.sh` runs a single-node k3s cluster in a QEMU VM with Fedora 44 Cloud.
-kind would use the host kernel, and virtme-ng shares the host's root
-filesystem, so neither can host the cluster. `provision` builds pyrite in the
-VM against Fedora's kernel, runs the harness there, loads the module at boot
-with `uuid_seed=1`, and installs k3s. SELinux is permissive in the VM, because
-k3s on Fedora otherwise needs Rancher's policy package. The host needs QEMU
-with KVM, xorriso, gpg, podman and Go.
+`vm/vm.sh` runs QEMU VMs with Fedora 44 Cloud. VM 1 is a single-node k3s
+cluster, and `vm/vm.sh up N` adds VMs 2..N as plain nodes for schedulers that
+span machines. kind would use the host kernel, and virtme-ng shares the host's
+root filesystem, so neither can host the cluster. `provision` works on every
+running VM at once, each VM logging to its own `provision.log`. In each one it
+builds pyrite against Fedora's kernel, runs the harness, loads the module at
+boot with `uuid_seed` set to the VM's number, and lets any user open
+`/dev/pyriteN`, as with `/dev/nvidia*`; in VM 1 it also installs k3s. A VM
+needs this once, and `up` names the VMs that still lack pyrite. VM I answers
+SSH on port 2221+I. SELinux is permissive in VM 1, because k3s on Fedora
+otherwise needs Rancher's policy package. The host needs QEMU with KVM,
+xorriso, gpg, podman and Go.
 
 | Step | Command |
 | --- | --- |
-| Boot the VM (downloads the image the first time) | `vm/vm.sh up` |
-| Build and test pyrite in the VM, load it, install k3s | `vm/vm.sh provision` |
+| Boot the VM, or VMs 1..N (downloads the image the first time) | `vm/vm.sh up [N]` |
+| Build and test pyrite in every running VM, load it, install k3s in VM 1 | `vm/vm.sh provision` |
 | Plugin unit tests | `make -C deviceplugin test` |
 | End-to-end test | `deviceplugin/e2e/run.sh` |
-| Shell in the VM | `vm/vm.sh ssh` |
-| Stop the VM, or delete its disk | `vm/vm.sh down`, `vm/vm.sh destroy` |
+| Shell in VM 1, or in VM I | `vm/vm.sh ssh`, `vm/vm.sh ssh -n I` |
+| Stop the VMs, or delete their disks | `vm/vm.sh down`, `vm/vm.sh destroy` |
 
 All commands run on the host. VM files go in `./.vm` and Go caches in
 `./.cache/go`; git ignores both.
@@ -603,7 +608,7 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | `deviceplugin/` | Kubernetes device plugin (Go), its image, DaemonSet and end-to-end test |
 | `qualifier/` | node agent (Go) that qualifies, quarantines and requalifies devices, with its image, DaemonSet and end-to-end test |
 | `experiment/` | qualification experiment: `run.sh`, `analyze.py` and the results |
-| `vm/vm.sh` | single-node k3s VM for the plugin and the agent |
+| `vm/vm.sh` | QEMU VMs: single-node k3s for the plugin and the agent, plus plain nodes |
 | `Kbuild`, `Makefile` | out-of-tree build and `checkpatch` |
 
 ## License
