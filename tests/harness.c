@@ -3,6 +3,7 @@
 #include <sys/wait.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -219,6 +220,43 @@ static int health_is(int index, const char *want, unsigned long long want_xid)
 	return !read_sysfs_str(index, "health", health, sizeof(health)) &&
 		!strcmp(health, want) &&
 		!read_sysfs_u64(index, "last_xid", &xid) && xid == want_xid;
+}
+
+/* Open a device's health file for poll(); reading it once arms the next event */
+static int health_watch(int index)
+{
+	char path[128], buf[16];
+	int fd;
+
+	snprintf(path, sizeof(path), "/sys/class/pyrite/pyrite%d/health", index);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -errno;
+	if (read(fd, buf, sizeof(buf)) < 0) {
+		close(fd);
+		return -EIO;
+	}
+
+	return fd;
+}
+
+/* 1 if the health file signals within timeout_ms, else 0; reading re-arms it */
+static int health_event(int fd, int timeout_ms)
+{
+	struct pollfd p = { .fd = fd, .events = POLLPRI };
+	char buf[16];
+	int n;
+
+	n = poll(&p, 1, timeout_ms);
+	if (n < 0)
+		return -errno;
+	if (n == 0 || !(p.revents & POLLPRI))
+		return 0;
+	if (lseek(fd, 0, SEEK_SET) < 0 || read(fd, buf, sizeof(buf)) < 0)
+		return -EIO;
+
+	return 1;
 }
 
 /* "GPU-" + RFC 4122 v4: xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx, lowercase */
@@ -1105,6 +1143,67 @@ out:
 	inject(1, "reset");
 }
 
+/* Every change to health or last_xid wakes poll() on the health file */
+static void t_health_events(void)
+{
+	unsigned long long id;
+	int hfd, fd;
+
+	hfd = health_watch(2);
+	if (hfd < 0) {
+		report("health_events", 0, "open health failed");
+		return;
+	}
+	fd = open(DEV2, O_RDWR);
+	if (fd < 0) {
+		report("health_events", 0, "open failed");
+		close(hfd);
+		return;
+	}
+
+	if (health_event(hfd, 0) != 0) {
+		report("health_events", 0, "event before any change");
+		goto out;
+	}
+
+	if (inject(2, "xid 79") || health_event(hfd, 1000) != 1 ||
+			inject(2, "lost") || health_event(hfd, 1000) != 1 ||
+			inject(2, "reset") || health_event(hfd, 1000) != 1) {
+		report("health_events", 0, "inject xid, lost or reset without an event");
+		goto out;
+	}
+
+	/* a refused reset changes nothing, so it wakes no one */
+	if (do_alloc(fd, SZ_4M, &id, NULL) || inject(2, "xid 31") ||
+			health_event(hfd, 1000) != 1 ||
+			sysfs_write(2, "reset", "1") != -EBUSY ||
+			health_event(hfd, 100) != 0) {
+		report("health_events", 0, "refused reset raised an event");
+		goto out;
+	}
+
+	if (do_free(fd, id) || sysfs_write(2, "reset", "1") ||
+			health_event(hfd, 1000) != 1) {
+		report("health_events", 0, "sysfs reset without an event");
+		goto out;
+	}
+
+	/* a stuck cell alone is no event; the read that turns health xid is */
+	if (inject(2, "stuck ue 300 7 0") || health_event(hfd, 100) != 0 ||
+			poke_peek(fd, 300, 0x80) != -EIO ||
+			health_event(hfd, 1000) != 1 || !health_is(2, "xid", 48)) {
+		report("health_events", 0, "uncorrectable ECC error without an event");
+		goto out;
+	}
+
+	report("health_events", 1, NULL);
+out:
+	close(fd);
+	close(hfd);
+	inject(2, "clear");
+	inject(2, "reset");
+}
+
 int main(void)
 {
 	t_rounding();
@@ -1123,6 +1222,7 @@ int main(void)
 	t_rate();
 	t_fault_cmds();
 	t_reset();
+	t_health_events();
 
 	printf("%d failure(s)\n", failures);
 	return failures;

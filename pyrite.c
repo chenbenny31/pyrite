@@ -236,6 +236,16 @@ static ssize_t health_show(struct device *d,
 }
 static DEVICE_ATTR_RO(health);
 
+/*
+ * Wake poll() on the health file: health or last_xid was just set. Pollers
+ * read health and last_xid again, so an Xid on a device already in xid is an
+ * event too, as with NVML. Called without dev->lock.
+ */
+static void pyrite_health_changed(struct pyrite_dev *dev)
+{
+	sysfs_notify(&dev->device->kobj, NULL, "health");
+}
+
 static ssize_t last_xid_show(struct device *d,
 		struct device_attribute *attr, char *buf)
 {
@@ -307,6 +317,7 @@ static ssize_t reset_store(struct device *d, struct device_attribute *attr,
 		return ret;
 
 	dev_info(dev->device, "reset\n");
+	pyrite_health_changed(dev);
 	return count;
 }
 static DEVICE_ATTR_WO(reset);
@@ -731,6 +742,7 @@ static ssize_t pyrite_read(struct file *filp, char __user *ubuf,
 		if (ue) {
 			dev_warn(dev->device, "Xid %u: uncorrectable ECC error\n",
 				PYRITE_XID_DBE);
+			pyrite_health_changed(dev);
 			ret = -EIO;
 			break;
 		}
@@ -903,12 +915,14 @@ static ssize_t pyrite_inject_write(struct file *filp, const char __user *ubuf,
 		mutex_unlock(&dev->lock);
 
 		dev_warn(dev->device, "Xid %u\n", xid);
+		pyrite_health_changed(dev);
 	} else if (sysfs_streq(cmd, "lost")) {
 		mutex_lock(&dev->lock);
 		dev->health = PYRITE_HEALTH_LOST;
 		mutex_unlock(&dev->lock);
 
 		dev_err(dev->device, "fell off the bus\n");
+		pyrite_health_changed(dev);
 	} else if (sysfs_streq(cmd, "reset")) {
 		mutex_lock(&dev->lock);
 		dev->health = PYRITE_HEALTH_OK;
@@ -916,6 +930,7 @@ static ssize_t pyrite_inject_write(struct file *filp, const char __user *ubuf,
 		mutex_unlock(&dev->lock);
 
 		dev_info(dev->device, "reset\n");
+		pyrite_health_changed(dev);
 	} else if (str_has_prefix(cmd, "stuck ")) {
 		ret = pyrite_inject_stuck(dev, cmd + 6);
 		if (ret)
