@@ -9,6 +9,7 @@
 modules.order
 tests/harness
 tools/qualify
+nvml/libnvidia-ml.so.1
 bench/ioctl_bench
 AGENTS.md
 AGENT_README.md

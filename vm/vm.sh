@@ -5,8 +5,8 @@
 # Kubernetes device plugin; VMs 2..N add plain nodes for multi-node schedulers
 #
 #   vm/vm.sh up [N]            boot VMs 1..N (default 1), creating them on first use
-#   vm/vm.sh provision         build, test and load pyrite in every running VM at once;
-#                              install k3s in VM 1
+#   vm/vm.sh provision         build, test and load pyrite in every running VM at once,
+#                              with NVML and dcgmi stand-ins; install k3s in VM 1
 #   vm/vm.sh ssh [-n I] [cmd]  shell or command in VM I (default 1)
 #   vm/vm.sh down              shut every VM down
 #   vm/vm.sh destroy           shut down and delete the VM disks (keeps the image)
@@ -202,8 +202,20 @@ provision_vm() {
         echo 'options pyrite ndev=4 uuid_seed=$UUID_SEED' | sudo tee /etc/modprobe.d/pyrite.conf > /dev/null &&
         sudo modprobe pyrite"
 
+    # pyrite under NVIDIA's names, as on a GPU machine: libnvidia-ml.so.1 and dcgmi
+    # stand-ins, so NVML and DCGM programs run unchanged. Only in these VMs, since the
+    # library would shadow a real driver's. test.py then checks NVML's answers on the
+    # loaded module, Xid events from injected faults included
+    vssh 'make -s -C pyrite/nvml && sudo make -s -C pyrite/nvml install &&
+        echo /usr/local/lib64 | sudo tee /etc/ld.so.conf.d/pyrite-nvml.conf > /dev/null &&
+        sudo ldconfig &&
+        gcc -Wall -Wextra -O2 -o pyrite/tools/qualify pyrite/tools/qualify.c &&
+        sudo install -m 755 pyrite/tools/qualify /usr/local/bin/pyrite-qualify &&
+        sudo install -m 755 pyrite/nvml/dcgmi /usr/local/bin/dcgmi'
+    vssh 'sudo python3 pyrite/nvml/test.py > nvml-test.log 2>&1 || { cat nvml-test.log; exit 1; }'
+
     if [ -z "$K3S" ]; then
-        echo "vm.sh: $NODE provisioned; pyrite loaded"
+        echo "vm.sh: $NODE provisioned; pyrite loaded, NVML and dcgmi stand-ins installed"
         return
     fi
     if ! vssh "k3s --version 2>/dev/null | grep -qF '$K3S_VERSION'"; then
@@ -214,7 +226,7 @@ provision_vm() {
     fi
     vssh "timeout 180 sh -c 'until k3s kubectl get node $NODE > /dev/null 2>&1; do sleep 2; done' &&
         k3s kubectl wait --for=condition=Ready node/$NODE --timeout=180s"
-    echo "vm.sh: $NODE provisioned; pyrite loaded, k3s $K3S_VERSION ready"
+    echo "vm.sh: $NODE provisioned; pyrite loaded, NVML and dcgmi stand-ins installed, k3s $K3S_VERSION ready"
 }
 
 # Start provisioning the selected VM in the background, or skip it when it is not running

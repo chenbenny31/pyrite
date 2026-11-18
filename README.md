@@ -18,7 +18,7 @@ kill -9 %1
 cat /sys/class/pyrite/pyrite0/used_mb    # 0
 ```
 
-**Status:** the module, its UAPI header, a 16-test harness and `tests/run.sh`
+**Status:** the module, its UAPI header, a 17-test harness and `tests/run.sh`
 are done, including device health, scratch memory and fault injection. The
 tests pass on the plain kernel and on a debug kernel with KASAN, lockdep and
 kmemleak. A [Kubernetes device plugin](#kubernetes) hands the devices to pods
@@ -26,7 +26,9 @@ in a k3s VM and stops handing out a device once it fails. A [node
 agent](#qualification) finds bad devices, silent memory errors included, with a
 known-answer test and keeps them out of service until they pass again. An
 [experiment](#experiment) measures how fast it finds a bad device and what
-false alarms cost. [Planned](#planned) lists what comes next.
+false alarms cost. [NVML and dcgmi stand-ins](#nvml-and-cuda) make the devices
+look like NVIDIA GPUs, so [Roster](https://github.com/chenbenny31/roster) runs
+on the VMs unchanged. [Planned](#planned) lists what comes next.
 
 ## How it differs
 
@@ -67,14 +69,34 @@ child exits too.
 
 ## NVML and CUDA
 
-The queries follow NVML's shape, so a backend written for pyrite has the same
-structure as an NVML one. `QUERY_DEVICE` matches `nvmlDeviceGetMemoryInfo`
-plus a utilization figure, and `QUERY_PROCS` matches
-`nvmlDeviceGetComputeRunningProcesses`.
+The queries follow NVML's shape. `QUERY_DEVICE` matches
+`nvmlDeviceGetMemoryInfo` plus a utilization figure, and `QUERY_PROCS` matches
+`nvmlDeviceGetComputeRunningProcesses`. `nvml/` builds on them so that a
+program written for NVIDIA GPUs runs on pyrite unchanged:
+
+- `libnvidia-ml.so.1` answers the NVML calls a scheduler makes, for the devices
+  the caller can open. Each is named `NVIDIA pyrite` and keeps its sysfs UUID.
+  Memory, utilization and processes come from the ioctls; temperature, power,
+  throttling and page retirement are not supported. Health turning `xid` is a
+  critical Xid event carrying `last_xid`, and `lost` is Xid 79, after which the
+  device's readings fail with `GPU_IS_LOST`.
+- `dcgmi` answers `discovery -l` and `diag -r LEVEL -i ID [-j]`. A device whose
+  health is not `ok` fails, since it needs a reset. Otherwise
+  `pyrite-qualify` (`tools/qualify`) tests its scratch memory, with more passes
+  at higher levels.
+- `test.py` checks an NVML library through its C ABI. Against NVIDIA's own
+  library it checks the answers the stand-in copies. Against the stand-in it
+  also compares each device with sysfs and, as root, injects faults and checks
+  the events.
+
+`vm/vm.sh provision` installs them in each VM under `/usr/local`. Install them
+nowhere else, because the library would shadow a real NVIDIA driver's. With
+them, Roster built with `--features nvml` lists the devices, quarantines one
+within milliseconds of an injected Xid, and qualifies them through `dcgmi`.
 
 An allocation is only an entry in a ledger, so no memory is reserved and no
-hardware is touched. pyrite does not implement CUDA, and NVML and `nvidia-smi`
-cannot see its devices.
+hardware is touched. pyrite does not implement CUDA, and `nvidia-smi` needs
+far more of NVML than the stand-in has.
 
 ## Devices and parameters
 
@@ -98,7 +120,7 @@ read-only except `reset`:
 | `numa_node` | always `0` |
 | `pcie_addr` | `0000:NN:00.0`, from the device index |
 | `uuid` | `GPU-` plus a version 4 UUID |
-| `health` | `ok`, `xid` or `lost`; see [Faults](#faults) |
+| `health` | `ok`, `xid` or `lost`; see [Faults](#faults). `poll()` with `POLLPRI` wakes on every change to `health` or `last_xid` |
 | `last_xid` | last injected Xid code; `0` if none since load or reset |
 | `scratch_kb` | scratch memory size in KiB |
 | `ecc_ce_count` | corrected memory errors since load or `clear` |
@@ -350,6 +372,7 @@ run on the wrong kernel cannot pass.
 | `t_rate` | 3 | at 1,000,000 ppm a page of zeros reads back with exactly one bit set; at 0 it reads back clean |
 | `t_fault_cmds` | 3 | malformed `stuck` and `rate` commands return `EINVAL`, and a 65th stuck cell returns `ENOSPC` |
 | `t_reset` | 1 | sysfs `reset` returns `EBUSY` while an allocation exists and works once it is freed, even with the descriptor still open; values other than `1` return `EINVAL`; a stuck memory bit survives it |
+| `t_health_events` | 2 | `poll()` on `health` wakes after `xid`, `lost`, debugfs and sysfs `reset`, and an uncorrectable read; not before any change, after a refused reset, or after a stuck cell is added |
 
 The harness needs a fresh load with at least four devices, because it opens
 `/dev/pyrite0` to `/dev/pyrite3` directly and checks exact `used_mb` values.
@@ -426,8 +449,11 @@ root filesystem, so neither can host the cluster. `provision` works on every
 running VM at once, each VM logging to its own `provision.log`. In each one it
 builds pyrite against Fedora's kernel, runs the harness, loads the module at
 boot with `uuid_seed` set to the VM's number, and lets any user open
-`/dev/pyriteN`, as with `/dev/nvidia*`; in VM 1 it also installs k3s. A VM
-needs this once, and `up` names the VMs that still lack pyrite. VM I answers
+`/dev/pyriteN`, as with `/dev/nvidia*`. It also installs the [NVML and dcgmi
+stand-ins](#nvml-and-cuda) and runs `nvml/test.py`, and in VM 1 it installs
+k3s. A VM needs this once, and `up` names the VMs that still lack pyrite. The
+harness reloads the module, so stop programs that hold the devices, such as a
+scheduler using NVML, before provisioning again. VM I answers
 SSH on port 2221+I. SELinux is permissive in VM 1, because k3s on Fedora
 otherwise needs Rancher's policy package. The host needs QEMU with KVM,
 xorriso, gpg, podman and Go.
@@ -435,7 +461,7 @@ xorriso, gpg, podman and Go.
 | Step | Command |
 | --- | --- |
 | Boot the VM, or VMs 1..N (downloads the image the first time) | `vm/vm.sh up [N]` |
-| Build and test pyrite in every running VM, load it, install k3s in VM 1 | `vm/vm.sh provision` |
+| Build and test pyrite in every running VM, load it, install the NVML and dcgmi stand-ins, install k3s in VM 1 | `vm/vm.sh provision` |
 | Plugin unit tests | `make -C deviceplugin test` |
 | End-to-end test | `deviceplugin/e2e/run.sh` |
 | Shell in VM 1, or in VM I | `vm/vm.sh ssh`, `vm/vm.sh ssh -n I` |
@@ -571,9 +597,10 @@ change up to about 10 s later, when kubelet next posts node status.
 Still to come are the ioctl latency benchmark, an ABI reference, and two
 features from [Roster](https://github.com/chenbenny31/roster)'s design:
 exclusive-process mode (a second process's ALLOC gets `EBUSY`) and delayed
-reclaim (freed memory stays counted for a set time after release). Integration
-with Roster comes last. MIG/MPS, memory mapping, thermals and topology are not
-planned.
+reclaim (freed memory stays counted for a set time after release). After them
+come scenario files that set up a fleet in one step, for example 100 GPUs with
+5 faulty, and per-device vendor and model with an AMD SMI stand-in.
+MIG/MPS, memory mapping, thermals and topology are not planned.
 
 ## Related work
 
@@ -600,11 +627,12 @@ The UAPI can change at any time. Load it only in a disposable VM.
 | --- | --- |
 | `pyrite.c` | the module |
 | `uapi/pyrite.h` | ioctl structs and commands, shared with userspace |
-| `tests/harness.c` | 16-test harness |
+| `tests/harness.c` | 17-test harness |
 | `tests/run.sh` | in-guest gate: load, test, unload, check `dmesg`, lockdep and kmemleak |
 | `tests/hold.c` | reclaim demo from the top of this README |
 | `tests/qualify.sh` | tests of `qualify` against injected memory errors |
 | `tools/qualify.c` | known-answer test of scratch memory |
+| `nvml/` | NVML library and `dcgmi` stand-ins, and `test.py`, their ABI test |
 | `deviceplugin/` | Kubernetes device plugin (Go), its image, DaemonSet and end-to-end test |
 | `qualifier/` | node agent (Go) that qualifies, quarantines and requalifies devices, with its image, DaemonSet and end-to-end test |
 | `experiment/` | qualification experiment: `run.sh`, `analyze.py` and the results |

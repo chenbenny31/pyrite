@@ -1,0 +1,120 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# dcgmi stand-in: the DCGM commands a scheduler qualifies cards with, over pyrite's
+# mock GPUs. A card's DCGM id is its pyrite minor.
+#
+#   dcgmi discovery -l               the cards this user can open, with their UUIDs
+#   dcgmi diag -r LEVEL -i ID [-j]   GPU Health: health must be ok, as a card with an
+#                                    Xid needs a reset first; Memory: pyrite-qualify
+#                                    tests scratch memory, 1, 4 or 8 passes at level
+#                                    1, 2 or 3. -j prints DCGM's JSON layout.
+#
+# Exit status: 0 every test passed, 1 a test failed, 2 bad usage or no such card.
+set -u
+
+SYSFS=/sys/class/pyrite
+
+usage() {
+    echo "usage: dcgmi discovery -l | dcgmi diag -r LEVEL -i GPU_ID [-j]   (pyrite stand-in)" >&2
+    exit 2
+}
+
+# Minors of the cards this user can open, in order
+cards() {
+    for dir in "$SYSFS"/pyrite*; do
+        [ -e "$dir" ] || continue
+        minor=${dir##*/pyrite}
+        [ -r "/dev/pyrite$minor" ] && [ -w "/dev/pyrite$minor" ] && echo "$minor"
+    done | sort -n
+}
+
+discovery() {
+    rule="+--------+----------------------------------------------------------------------+"
+    list=$(cards)
+    echo "$(echo "$list" | grep -c .) GPUs found."
+    echo "$rule"
+    printf '| %-6s | %-68s |\n' "GPU ID" "Device Information"
+    echo "$rule"
+    for minor in $list; do
+        printf '| %-6s | %-68s |\n' "$minor" "Name: NVIDIA pyrite" \
+            "" "PCI Bus ID: $(cat "$SYSFS/pyrite$minor/pcie_addr")" \
+            "" "Device UUID: $(cat "$SYSFS/pyrite$minor/uuid")"
+        echo "$rule"
+    done
+}
+
+# One category with one test, as in DCGM's JSON: category, test, status, message, separator
+category() {
+    message=$(printf '%s' "$4" | tr -d '"\\' | tr '\n' ' ')
+    printf '      { "category" : "%s", "tests" : [ { "name" : "%s", "results" : [ { "gpu_id" : "%s", "status" : "%s"' \
+        "$1" "$2" "$id" "$3"
+    if [ "$3" = Fail ]; then
+        printf ', "warnings" : [ { "warning" : "%s" } ]' "$message"
+    elif [ -n "$message" ]; then
+        printf ', "info" : [ "%s" ]' "$message"
+    fi
+    printf ' } ] } ] }%s\n' "$5"
+}
+
+diag() {
+    level= id= json=
+    OPTIND=1
+    while getopts "r:i:j" opt; do
+        case $opt in
+        r) level=$OPTARG ;;
+        i) id=$OPTARG ;;
+        j) json=1 ;;
+        *) usage ;;
+        esac
+    done
+    case $level in
+    1) passes=1 ;;
+    2) passes=4 ;;
+    3) passes=8 ;;
+    *) usage ;;
+    esac
+    if [ -z "$id" ] || ! cards | grep -qx "$id"; then
+        echo "dcgmi: no GPU '$id'" >&2
+        exit 2
+    fi
+
+    health=$(cat "$SYSFS/pyrite$id/health")
+    if [ "$health" = ok ]; then
+        health_status=Pass health_message=
+        if memory_message=$(pyrite-qualify -n "$passes" "/dev/pyrite$id" 2>&1); then
+            memory_status=Pass
+        else
+            memory_status=Fail
+        fi
+    else
+        health_status=Fail
+        health_message="health $health, last Xid $(cat "$SYSFS/pyrite$id/last_xid"): needs a reset"
+        memory_status=Skip memory_message=
+    fi
+
+    if [ -n "$json" ]; then
+        printf '{\n  "DCGM GPU Diagnostic" : {\n    "test_categories" : [\n'
+        category Deployment "GPU Health" "$health_status" "$health_message" ,
+        category Hardware Memory "$memory_status" "$memory_message" ""
+        printf '    ],\n    "version" : "pyrite"\n  }\n}\n'
+    else
+        printf 'GPU %s, level %s\n' "$id" "$level"
+        printf '  %-12s %s %s\n' "GPU Health" "$health_status" "$health_message" \
+            Memory "$memory_status" "$memory_message"
+    fi
+    [ "$health_status" = Pass ] && [ "$memory_status" = Pass ]
+}
+
+case ${1:-} in
+discovery)
+    [ "${2:-}" = -l ] || usage
+    discovery
+    ;;
+diag)
+    shift
+    diag "$@" || exit 1
+    ;;
+*)
+    usage
+    ;;
+esac
